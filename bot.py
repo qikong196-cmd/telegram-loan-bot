@@ -703,6 +703,29 @@ def get_balance_by_employee_id(employee_telegram_id: int):
     return borrowed, repaid, balance
 
 def get_currency_summary_by_employee(employee_telegram_id: int):
+    def get_currency_net_by_employee(employee_telegram_id: int):
+    summary = get_currency_summary_by_employee(employee_telegram_id)
+
+    usdt_net = summary["repay"]["USDT"] - summary["borrow"]["USDT"]
+    thb_net = summary["repay"]["THB"] - summary["borrow"]["THB"]
+
+    return {
+        "USDT": usdt_net,
+        "THB": thb_net,
+    }
+
+def format_signed_balance(amount: float, currency: str) -> str:
+    if amount > 0:
+        sign_amount = f"+{amount:.2f}"
+        status = "结余"
+    elif amount < 0:
+        sign_amount = f"{amount:.2f}"
+        status = "欠款"
+    else:
+        sign_amount = "0.00"
+        status = "已清"
+
+    return f"{currency}：{sign_amount}（{status}）"
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -869,15 +892,13 @@ def build_total_text_for_user(user_id: int) -> str:
         return "未找到你的员工资料。"
 
     name = employee[2]
-    summary = get_currency_summary_by_employee(user_id)
+    net = get_currency_net_by_employee(user_id)
 
     return (
         f"💰 我的总账\n\n"
         f"员工：{name}\n\n"
-        f"借款 USDT：{summary['borrow']['USDT']:.2f} USDT\n"
-        f"借款 THB：{summary['borrow']['THB']:.2f} THB\n"
-        f"还款 USDT：{summary['repay']['USDT']:.2f} USDT\n"
-        f"还款 THB：{summary['repay']['THB']:.2f} THB"
+        f"{format_signed_balance(net['USDT'], 'USDT')}\n"
+        f"{format_signed_balance(net['THB'], 'THB')}"
     )
 
 def build_profile_text_for_user(user_id: int) -> str:
@@ -913,16 +934,17 @@ def build_all_report_text() -> str:
     lines = ["📊 全部报表：", ""]
 
     for _employee_id, name, summary in rows:
+        usdt_net = summary["repay"]["USDT"] - summary["borrow"]["USDT"]
+        thb_net = summary["repay"]["THB"] - summary["borrow"]["THB"]
+
         lines.append(
-            f"{name}："
-            f"\n借款 USDT：{summary['borrow']['USDT']:.2f} USDT"
-            f"\n借款 THB：{summary['borrow']['THB']:.2f} THB"
-            f"\n还款 USDT：{summary['repay']['USDT']:.2f} USDT"
-            f"\n还款 THB：{summary['repay']['THB']:.2f} THB\n"
+            f"{name}：\n"
+            f"{format_signed_balance(usdt_net, 'USDT')}\n"
+            f"{format_signed_balance(thb_net, 'THB')}\n"
         )
 
     return "\n".join(lines)
-
+    
 def build_employee_flow_text(target_user_id: int) -> str:
     employee = get_employee_by_telegram_id(target_user_id)
     if not employee:
@@ -1460,27 +1482,24 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             employee_name = result["employee_name"]
             parsed = result["parsed"]
 
-            if session["action"] == "borrow":
-                msg = (
-                    f"✅ 已记录借资\n\n"
-                    f"👤 员工：{employee_name}\n"
-                    f"📝 录入金额：{parsed['original_value']:.2f} {parsed['unit']}\n\n"
-                    f"累计借款 USDT：{summary['borrow']['USDT']:.2f} USDT\n"
-                    f"累计借款 THB：{summary['borrow']['THB']:.2f} THB\n"
-                    f"累计还款 USDT：{summary['repay']['USDT']:.2f} USDT\n"
-                    f"累计还款 THB：{summary['repay']['THB']:.2f} THB"
-                )
-            else:
-                msg = (
-                    f"✅ 已记录还款\n\n"
-                    f"👤 员工：{employee_name}\n"
-                    f"📝 录入金额：{parsed['original_value']:.2f} {parsed['unit']}\n\n"
-                    f"累计借款 USDT：{summary['borrow']['USDT']:.2f} USDT\n"
-                    f"累计借款 THB：{summary['borrow']['THB']:.2f} THB\n"
-                    f"累计还款 USDT：{summary['repay']['USDT']:.2f} USDT\n"
-                    f"累计还款 THB：{summary['repay']['THB']:.2f} THB"
-                )
+            net = get_currency_net_by_employee(employee_id)
 
+if session["action"] == "borrow":
+    msg = (
+        f"✅ 已记录借款\n\n"
+        f"👤 员工：{employee_name}\n"
+        f"📝 录入金额：{parsed['original_value']:.2f} {parsed['unit']}\n\n"
+        f"{format_signed_balance(net['USDT'], 'USDT')}\n"
+        f"{format_signed_balance(net['THB'], 'THB')}"
+    )
+else:
+    msg = (
+        f"✅ 已记录还款\n\n"
+        f"👤 员工：{employee_name}\n"
+        f"📝 录入金额：{parsed['original_value']:.2f} {parsed['unit']}\n\n"
+        f"{format_signed_balance(net['USDT'], 'USDT')}\n"
+        f"{format_signed_balance(net['THB'], 'THB')}"
+    )
             await update.message.reply_text(msg, reply_markup=get_main_menu_for_role(role))
             return
 
