@@ -1623,6 +1623,7 @@ def main():
         raise ValueError("缺少 BOT_TOKEN 环境变量")
 
     init_db()
+    logging.info("ADMIN_IDS loaded: %s", ADMIN_IDS)
 
     app = (
         Application.builder()
