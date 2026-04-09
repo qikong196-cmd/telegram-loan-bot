@@ -68,6 +68,16 @@ def get_private_link() -> str:
     return f"https://t.me/{BOT_USERNAME}"
 
 
+def get_register_jump_button():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("air_4（找我登记）", url=get_private_link())]]
+    )
+
+
+def get_private_jump_text(prefix: str = "请点击按钮前往私聊") -> str:
+    return f"{prefix}\n\n点击下方按钮即可直达机器人私聊窗口。"
+
+
 def get_conn():
     return sqlite3.connect(DB_PATH)
 
@@ -123,6 +133,12 @@ def init_db():
         """
     )
 
+    conn.commit()
+    conn.close()
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_employees_telegram_id ON employees(telegram_id)")
     conn.commit()
     conn.close()
 
@@ -207,12 +223,14 @@ def get_role(user_id: int) -> str:
     if not row:
         return "guest"
 
-    role = row[3]
+    role = (row[3] or "staff").lower()
     approved = row[4]
 
     if approved != 1:
         return "pending"
 
+    if role == "owner":
+        return "owner"
     if role == "admin":
         return "admin"
 
@@ -220,7 +238,7 @@ def get_role(user_id: int) -> str:
 
 
 def is_manager(user_id: int) -> bool:
-    return get_role(user_id) in {"superadmin", "admin"}
+    return get_role(user_id) in {"superadmin", "owner", "admin"}
 
 
 def register_employee_request(user_id: int, username: str, name: str) -> str:
@@ -258,6 +276,49 @@ def register_employee_request(user_id: int, username: str, name: str) -> str:
     conn.commit()
     conn.close()
     return f"登记成功：{name}，等待管理员审批。"
+
+
+def admin_create_or_update_employee(telegram_id: int, name: str, role: str, operator_id: int, username: str = "") -> str:
+    role = role.strip().lower()
+    if role not in {"staff", "admin", "owner"}:
+        role = "staff"
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT telegram_id FROM employees WHERE telegram_id = ?", (telegram_id,))
+    row = cur.fetchone()
+
+    now_text = now_local().strftime("%Y-%m-%d %H:%M:%S")
+    if row:
+        cur.execute(
+            """
+            UPDATE employees
+            SET tg_username = CASE WHEN ? != '' THEN ? ELSE tg_username END,
+                name = ?,
+                role = ?,
+                approved = 1,
+                approved_at = ?,
+                approved_by = ?
+            WHERE telegram_id = ?
+            """,
+            (username, username, name, role, now_text, operator_id, telegram_id),
+        )
+        conn.commit()
+        conn.close()
+        return f"已更新员工并设为已通过：{name}（{telegram_id} / {role}）"
+
+    cur.execute(
+        """
+        INSERT INTO employees (
+            telegram_id, tg_username, name, role, approved, created_at, approved_at, approved_by
+        )
+        VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+        """,
+        (telegram_id, username, name, role, now_text, now_text, operator_id),
+    )
+    conn.commit()
+    conn.close()
+    return f"已新增员工并设为已通过：{name}（{telegram_id} / {role}）"
 
 
 def approve_employee(user_id: int, approved_by: int, role: str = "staff") -> bool:
@@ -390,9 +451,12 @@ def get_recent_rates(limit: int = 7):
 # ----------------------------
 # 菜单
 # ----------------------------
-def get_group_entry_menu():
+def get_group_entry_menu(is_manager_user: bool = False):
+    keyboard = [["📝 员工登记", "ℹ️ 帮助"]]
+    if is_manager_user:
+        keyboard.append(["🛠 管理中心"])
     return ReplyKeyboardMarkup(
-        [["📝 员工登记", "🛠 管理中心"]],
+        keyboard,
         resize_keyboard=True,
         one_time_keyboard=False,
     )
@@ -400,13 +464,13 @@ def get_group_entry_menu():
 
 def get_main_menu_for_role(role: str):
     if role == "guest":
-        keyboard = [["📝 员工登记"], ["ℹ️ 帮助"]]
+        keyboard = [["📝 员工登记", "ℹ️ 帮助"]]
     elif role == "pending":
-        keyboard = [["📨 审核状态"], ["ℹ️ 帮助"]]
+        keyboard = [["📨 审核状态", "ℹ️ 帮助"]]
     elif role == "staff":
         keyboard = [["📒 我的账本", "👤 我的资料"], ["📨 审核状态", "ℹ️ 帮助"]]
     else:
-        keyboard = [["📒 我的账本", "👤 我的资料"], ["🛠 管理中心", "ℹ️ 帮助"]]
+        keyboard = [["📒 我的账本", "👤 我的资料"], ["🛠 后台", "ℹ️ 帮助"], ["📨 审核状态"]]
 
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
 
@@ -423,15 +487,16 @@ def get_admin_center_menu():
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✅ 员工审批", callback_data="admin|approvals"),
-             InlineKeyboardButton("➕ 新增借款", callback_data="admin|borrow")],
-            [InlineKeyboardButton("💸 记录还款", callback_data="admin|repay"),
-             InlineKeyboardButton("📊 全部报表", callback_data="admin|report")],
-            [InlineKeyboardButton("📜 员工流水", callback_data="admin|employee_flow"),
-             InlineKeyboardButton("🗂 全部流水", callback_data="admin|all_flows")],
-            [InlineKeyboardButton("📆 今日全部流水", callback_data="admin|today_all_flows"),
-             InlineKeyboardButton("❌ 删除员工", callback_data="admin|delete_employee")],
-            [InlineKeyboardButton("💱 修改今日汇率", callback_data="admin|set_rate"),
-             InlineKeyboardButton("💱 查看今日汇率", callback_data="admin|show_rate")],
+             InlineKeyboardButton("👥 新增员工", callback_data="admin|add_employee")],
+            [InlineKeyboardButton("➕ 新增借款", callback_data="admin|borrow"),
+             InlineKeyboardButton("💸 记录还款", callback_data="admin|repay")],
+            [InlineKeyboardButton("📊 全部报表", callback_data="admin|report"),
+             InlineKeyboardButton("📜 员工流水", callback_data="admin|employee_flow")],
+            [InlineKeyboardButton("🗂 全部流水", callback_data="admin|all_flows"),
+             InlineKeyboardButton("📆 今日全部流水", callback_data="admin|today_all_flows")],
+            [InlineKeyboardButton("❌ 删除员工", callback_data="admin|delete_employee"),
+             InlineKeyboardButton("💱 修改今日汇率", callback_data="admin|set_rate")],
+            [InlineKeyboardButton("💱 查看今日汇率", callback_data="admin|show_rate")],
             [InlineKeyboardButton("🏠 返回首页", callback_data="menu|home")],
         ]
     )
@@ -958,13 +1023,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rate, _ = get_daily_rate(today_key())
 
     if is_group_chat(update):
-        await update.message.reply_text("📌 群入口：请点击按钮后前往私聊操作", reply_markup=get_group_entry_menu())
+        await update.message.reply_text(
+            "📌 群入口\n\n可使用：员工登记、帮助。\n管理员 / 拥有者可另外进入管理中心。",
+            reply_markup=get_group_entry_menu(is_manager(update.effective_user.id)),
+        )
+        await update.message.reply_text(
+            get_private_jump_text("登记后续操作、审核状态和后台功能都建议在私聊中完成"),
+            reply_markup=get_register_jump_button(),
+        )
         return
 
     msg = (
         "🤖 欢迎使用借资系统\n\n"
-        "员工：查看自己的账本和资料\n"
-        "管理员：进入管理中心操作\n\n"
+        "员工入口：员工登记、帮助、账本、资料\n"
+        "管理员 / 拥有者：可进入后台处理审批、员工与账目\n\n"
         f"今日汇率：1 USDT ≈ ฿{rate:.2f}"
     )
     await update.message.reply_text(msg, reply_markup=get_main_menu_for_role(role))
@@ -973,19 +1045,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = get_role(update.effective_user.id)
 
+    msg = (
+        "ℹ️ 帮助 / 简单流程说明\n\n"
+        "1. 先点击【员工登记】\n"
+        "2. 提交姓名后等待管理员审核\n"
+        "3. 审核通过后即可正常使用员工功能\n"
+        "4. 需要登记时，直接点击按钮进入私聊 air_4（找我登记）\n\n"
+        "员工可用：员工登记、审核状态、我的账本、我的资料\n"
+        "管理员 / 拥有者可用：后台、员工审批、新增员工、查账与报表"
+    )
+
     if is_group_chat(update):
-        await update.message.reply_text(f"请私聊机器人继续操作：\n{get_private_link()}", reply_markup=get_group_entry_menu())
+        await update.message.reply_text(
+            msg,
+            reply_markup=get_group_entry_menu(is_manager(update.effective_user.id)),
+        )
+        await update.message.reply_text(
+            get_private_jump_text("需要登记或处理资料时，请前往私聊"),
+            reply_markup=get_register_jump_button(),
+        )
         return
 
-    msg = (
-        "ℹ️ 使用说明\n\n"
-        "员工首页：\n"
-        "📒 我的账本\n"
-        "👤 我的资料\n"
-        "📨 审核状态\n\n"
-        "管理员首页：\n"
-        "🛠 管理中心"
-    )
     await update.message.reply_text(msg, reply_markup=get_main_menu_for_role(role))
 
 
@@ -1022,6 +1102,17 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         if not is_manager(user_id):
             return
         await query.message.reply_text("✅ 员工审批：", reply_markup=get_pending_approval_menu())
+        return
+
+    if data == "admin|add_employee":
+        if not is_manager(user_id):
+            await query.message.reply_text("你没有后台权限。", reply_markup=get_main_menu_for_role(role))
+            return
+        USER_SESSIONS[user_id] = {"waiting_add_employee_input": True}
+        await query.message.reply_text(
+            "请输入员工资料：\n姓名 | TelegramID | 角色(可选)\n例如：张三 | 123456789 | staff\n\n角色可填：staff / admin / owner",
+            reply_markup=get_main_menu_for_role(role),
+        )
         return
 
     if data == "admin|borrow":
@@ -1097,7 +1188,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             try:
                 await context.bot.send_message(
                     chat_id=target_user_id,
-                    text="✅ 你的员工登记已通过审核。",
+                    text="✅ 你的员工登记已通过审核。现在可以正常使用员工功能。",
                     reply_markup=get_main_menu_for_role("staff"),
                 )
             except Exception:
@@ -1208,15 +1299,43 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not text:
         return
 
-    # 群里只保留入口
+    # 群里保留入口与指引
     if is_group_chat(update):
         if text == "📝 员工登记":
-            await update.message.reply_text(f"👉 请私聊我完成员工登记：\n{get_private_link()}", reply_markup=get_group_entry_menu())
+            await update.message.reply_text(
+                "📝 员工登记请在私聊中进行。\n审核通过后即可正常使用员工功能。",
+                reply_markup=get_group_entry_menu(is_manager(user_id)),
+            )
+            await update.message.reply_text(
+                get_private_jump_text("点击下方按钮，直接去私聊登记"),
+                reply_markup=get_register_jump_button(),
+            )
             return
-        if text == "🛠 管理中心":
+        if text in ["ℹ️ 帮助", "帮助"]:
+            await help_cmd(update, context)
+            return
+        if text in ["🛠 管理中心", "🛠 后台"]:
             if not is_manager(user_id):
+                await update.message.reply_text(
+                    "当前账号没有管理中心权限。\n如你是员工，请使用【员工登记】或【帮助】；如需管理权限，请联系拥有者或管理员配置。",
+                    reply_markup=get_group_entry_menu(False),
+                )
                 return
-            await update.message.reply_text(f"👉 请到私聊中打开管理中心：\n{get_private_link()}", reply_markup=get_group_entry_menu())
+            await update.message.reply_text(
+                "🛠 管理中心请在私聊中打开。",
+                reply_markup=get_group_entry_menu(True),
+            )
+            await update.message.reply_text(
+                get_private_jump_text("点击下方按钮进入机器人后台"),
+                reply_markup=get_register_jump_button(),
+            )
+            return
+
+        if role in {"staff", "admin", "owner", "superadmin"}:
+            await update.message.reply_text(
+                "✅ 你已通过审核。账本、资料与后台请在私聊中使用。",
+                reply_markup=get_register_jump_button(),
+            )
             return
         return
 
@@ -1276,6 +1395,10 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             username = user.username or ""
             msg = register_employee_request(user_id, username, text)
             await update.message.reply_text(msg, reply_markup=get_main_menu_for_role(get_role(user_id)))
+            await update.message.reply_text(
+                "下一步：点击按钮进入私聊窗口，后续审核通知也会在这里处理。",
+                reply_markup=get_register_jump_button(),
+            )
 
             for admin_id in ADMIN_IDS:
                 try:
@@ -1291,6 +1414,44 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     await context.bot.send_message(chat_id=admin_id, text="\n".join(lines))
                 except Exception:
                     pass
+            return
+
+        if session.get("waiting_add_employee_input"):
+            if not is_manager(user_id):
+                USER_SESSIONS.pop(user_id, None)
+                return
+
+            raw = [part.strip() for part in text.replace("\n", "|").split("|") if part.strip()]
+            if len(raw) < 2:
+                await update.message.reply_text(
+                    "格式不正确。\n请按以下格式输入：\n姓名 | TelegramID | 角色(可选)\n例如：张三 | 123456789 | staff",
+                    reply_markup=get_main_menu_for_role(role),
+                )
+                return
+
+            name = raw[0]
+            try:
+                telegram_id = int(raw[1].replace("@", "").strip())
+            except Exception:
+                await update.message.reply_text(
+                    "Telegram ID 必须是数字。\n例如：张三 | 123456789 | staff",
+                    reply_markup=get_main_menu_for_role(role),
+                )
+                return
+
+            employee_role = raw[2].lower() if len(raw) >= 3 else "staff"
+            result_msg = admin_create_or_update_employee(telegram_id, name, employee_role, user_id)
+            USER_SESSIONS.pop(user_id, None)
+
+            await update.message.reply_text(result_msg, reply_markup=get_main_menu_for_role(role))
+            try:
+                await context.bot.send_message(
+                    chat_id=telegram_id,
+                    text="✅ 你的员工资料已由管理员处理并通过。后续可直接使用机器人功能。",
+                    reply_markup=get_main_menu_for_role(get_role(telegram_id)),
+                )
+            except Exception:
+                pass
             return
 
         if session.get("waiting_rate_input"):
@@ -1323,9 +1484,16 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if text == "📝 员工登记":
         if role != "guest":
             await update.message.reply_text("你已登记或已通过审核。", reply_markup=get_main_menu_for_role(role))
+            await update.message.reply_text(
+                "如需再次进入私聊窗口，请点击下方按钮。",
+                reply_markup=get_register_jump_button(),
+            )
             return
         USER_SESSIONS[user_id] = {"waiting_register_name": True}
-        await update.message.reply_text("请输入你的员工姓名：", reply_markup=get_main_menu_for_role(role))
+        await update.message.reply_text(
+            "请输入你的员工姓名。\n\n简单流程：登记 → 等待审核 → 审核通过后即可正常使用。",
+            reply_markup=get_main_menu_for_role(role),
+        )
         return
 
     if text == "📨 审核状态":
@@ -1373,10 +1541,14 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     # 管理员首页
-    if text == "🛠 管理中心":
+    if text in ["🛠 管理中心", "🛠 后台"]:
         if not is_manager(user_id):
+            await update.message.reply_text(
+                "当前账号没有管理中心权限。\n如需管理权限，请联系拥有者或管理员。",
+                reply_markup=get_main_menu_for_role(role),
+            )
             return
-        await update.message.reply_text("🛠 管理中心：", reply_markup=get_admin_center_menu())
+        await update.message.reply_text("🛠 后台管理中心：", reply_markup=get_admin_center_menu())
         return
 
 
