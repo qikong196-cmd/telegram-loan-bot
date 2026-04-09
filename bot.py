@@ -2,7 +2,7 @@ import os
 import time
 import sqlite3
 import logging
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 import requests
@@ -11,6 +11,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ChatPermissions,
 )
 from telegram.ext import (
     Application,
@@ -39,6 +40,14 @@ FX_CACHE_SECONDS = int(os.getenv("FX_CACHE_SECONDS", "60"))
 
 BOT_USERNAME = os.getenv("BOT_USERNAME", "Air_4bot")
 
+# 群防刷
+GROUP_COOLDOWN_SECONDS = 5
+GROUP_SPAM_MAX_VIOLATIONS = 3
+GROUP_SPAM_WINDOW_SECONDS = 600
+GROUP_MUTE_SECONDS = 600
+
+LOAN_REASONS = ["生活", "饮食", "K他命", "家里用", "交通费用"]
+
 ADMIN_IDS = set()
 for item in ADMIN_IDS_RAW.split(","):
     item = item.strip()
@@ -46,6 +55,7 @@ for item in ADMIN_IDS_RAW.split(","):
         ADMIN_IDS.add(int(item))
 
 USER_SESSIONS = {}
+GROUP_RATE_LIMIT = {}
 
 _fx_cache = {
     "thb_per_usdt": THB_PER_USDT_FALLBACK,
@@ -57,6 +67,9 @@ _fx_cache = {
 # ----------------------------
 def now_local() -> datetime:
     return datetime.now(APP_TZ)
+
+def now_ts() -> float:
+    return time.time()
 
 def today_key() -> str:
     return now_local().strftime("%Y-%m-%d")
@@ -104,6 +117,7 @@ def init_db():
             employee_telegram_id INTEGER NOT NULL,
             employee_name_snapshot TEXT NOT NULL,
             type TEXT NOT NULL CHECK(type IN ('borrow', 'repay')),
+            reason TEXT,
             original_amount REAL NOT NULL,
             original_currency TEXT NOT NULL,
             fx_rate REAL NOT NULL,
@@ -115,6 +129,11 @@ def init_db():
         )
         """
     )
+
+    try:
+        cur.execute("ALTER TABLE transactions ADD COLUMN reason TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     cur.execute(
         """
@@ -130,6 +149,70 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+# ----------------------------
+# 群防刷 / 自动禁言
+# ----------------------------
+def get_group_limit_key(chat_id: int, user_id: int) -> str:
+    return f"{chat_id}:{user_id}"
+
+async def handle_group_rate_limit(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    if user_id in ADMIN_IDS:
+        return False
+
+    chat = update.effective_chat
+    if not chat:
+        return False
+
+    key = get_group_limit_key(chat.id, user_id)
+    now = now_ts()
+
+    info = GROUP_RATE_LIMIT.get(
+        key,
+        {
+            "last_action_ts": 0.0,
+            "violations": [],
+            "muted_until": 0.0,
+        },
+    )
+
+    if now < info["muted_until"]:
+        return True
+
+    if now - info["last_action_ts"] < GROUP_COOLDOWN_SECONDS:
+        info["violations"] = [
+            ts for ts in info["violations"]
+            if now - ts <= GROUP_SPAM_WINDOW_SECONDS
+        ]
+        info["violations"].append(now)
+
+        if len(info["violations"]) > GROUP_SPAM_MAX_VIOLATIONS:
+            mute_until_ts = now + GROUP_MUTE_SECONDS
+            info["muted_until"] = mute_until_ts
+            GROUP_RATE_LIMIT[key] = info
+
+            try:
+                await context.bot.restrict_chat_member(
+                    chat_id=chat.id,
+                    user_id=user_id,
+                    permissions=ChatPermissions(can_send_messages=False),
+                    until_date=int(mute_until_ts),
+                )
+            except Exception as e:
+                logging.warning("自动禁言失败 user=%s chat=%s err=%s", user_id, chat.id, e)
+
+            return True
+
+        GROUP_RATE_LIMIT[key] = info
+        return True
+
+    info["last_action_ts"] = now
+    info["violations"] = [
+        ts for ts in info["violations"]
+        if now - ts <= GROUP_SPAM_WINDOW_SECONDS
+    ]
+    GROUP_RATE_LIMIT[key] = info
+    return False
 
 # ----------------------------
 # 角色 / 员工
@@ -310,8 +393,8 @@ def is_manager(user_id: int) -> bool:
 def get_live_thb_per_usdt() -> float:
     global _fx_cache
 
-    now_ts = time.time()
-    if now_ts - _fx_cache["updated_at"] < FX_CACHE_SECONDS:
+    now = time.time()
+    if now - _fx_cache["updated_at"] < FX_CACHE_SECONDS:
         return _fx_cache["thb_per_usdt"]
 
     headers = {}
@@ -319,10 +402,7 @@ def get_live_thb_per_usdt() -> float:
         headers["x-cg-demo-api-key"] = COINGECKO_DEMO_API_KEY
 
     url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {
-        "ids": "tether",
-        "vs_currencies": "thb",
-    }
+    params = {"ids": "tether", "vs_currencies": "thb"}
 
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=10)
@@ -334,7 +414,7 @@ def get_live_thb_per_usdt() -> float:
 
         _fx_cache = {
             "thb_per_usdt": rate,
-            "updated_at": now_ts,
+            "updated_at": now,
         }
         return rate
     except Exception as e:
@@ -412,13 +492,17 @@ def get_main_menu_for_role(role: str):
         ]
     elif role == "staff":
         keyboard = [
-            ["📒 我的账本", "👤 我的资料"],
+            ["📜 最近流水", "📚 历史记录"],
+            ["💰 我的总账", "👤 我的资料"],
             ["📨 审核状态", "ℹ️ 帮助"],
+            ["🏠 返回首页"],
         ]
     else:
         keyboard = [
-            ["📒 我的账本", "👤 我的资料"],
+            ["📜 最近流水", "📚 历史记录"],
+            ["💰 我的总账", "👤 我的资料"],
             ["🛠 管理中心", "ℹ️ 帮助"],
+            ["🏠 返回首页"],
         ]
 
     return ReplyKeyboardMarkup(
@@ -430,8 +514,8 @@ def get_main_menu_for_role(role: str):
 def get_wallet_menu():
     return ReplyKeyboardMarkup(
         [
-            ["📊 今日记录", "📜 最近流水"],
-            ["📚 历史记录", "💰 我的总账"],
+            ["📜 最近流水", "📚 历史记录"],
+            ["💰 我的总账"],
             ["🏠 返回首页"],
         ],
         resize_keyboard=True,
@@ -493,14 +577,40 @@ def get_employee_picker(action: str):
     rows.append([InlineKeyboardButton("🏠 返回首页", callback_data="menu|home")])
     return InlineKeyboardMarkup(rows)
 
-def get_currency_picker(action: str, employee_id: int):
+def get_reason_picker(employee_id: int):
+    rows = []
+    row = []
+    for reason in LOAN_REASONS:
+        row.append(
+            InlineKeyboardButton(reason, callback_data=f"borrow|reason|{employee_id}|{reason}")
+        )
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton("⬅️ 返回员工列表", callback_data="borrow|back_employees")])
+    rows.append([InlineKeyboardButton("🏠 返回首页", callback_data="menu|home")])
+    return InlineKeyboardMarkup(rows)
+
+def get_currency_picker(action: str, employee_id: int, reason: str = ""):
+    if action == "borrow":
+        back_callback = f"borrow|back_reason|{employee_id}"
+        usdt_callback = f"borrow|currency|{employee_id}|USDT|{reason}"
+        thb_callback = f"borrow|currency|{employee_id}|THB|{reason}"
+    else:
+        back_callback = f"{action}|back_employees"
+        usdt_callback = f"{action}|currency|{employee_id}|USDT"
+        thb_callback = f"{action}|currency|{employee_id}|THB"
+
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("💵 USDT", callback_data=f"{action}|currency|{employee_id}|USDT"),
-                InlineKeyboardButton("💴 泰铢", callback_data=f"{action}|currency|{employee_id}|THB"),
+                InlineKeyboardButton("💵 USDT", callback_data=usdt_callback),
+                InlineKeyboardButton("💴 泰铢", callback_data=thb_callback),
             ],
-            [InlineKeyboardButton("⬅️ 返回员工列表", callback_data=f"{action}|back_employees")],
+            [InlineKeyboardButton("⬅️ 返回上一页", callback_data=back_callback)],
             [InlineKeyboardButton("🏠 返回首页", callback_data="menu|home")],
         ]
     )
@@ -603,6 +713,7 @@ def record_transaction(
     amount_text: str,
     operator_id: int,
     operator_name: str,
+    reason: str | None = None,
 ):
     employee = get_employee_by_telegram_id(employee_telegram_id)
     if not employee:
@@ -625,6 +736,7 @@ def record_transaction(
             employee_telegram_id,
             employee_name_snapshot,
             type,
+            reason,
             original_amount,
             original_currency,
             fx_rate,
@@ -634,12 +746,13 @@ def record_transaction(
             created_at,
             date_key
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             employee_telegram_id,
             employee_name,
             tx_type,
+            reason,
             parsed["original_value"],
             parsed["unit"],
             rate,
@@ -657,6 +770,7 @@ def record_transaction(
         "employee_name": employee_name,
         "parsed": parsed,
         "rate": rate,
+        "reason": reason,
     }
 
 def get_currency_summary_by_employee(employee_telegram_id: int):
@@ -712,28 +826,29 @@ def format_signed_balance(amount: float, currency: str) -> str:
 
     return f"{currency}：{sign_amount}（{status}）"
 
-def get_today_transactions_by_employee(employee_telegram_id: int):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT type, original_amount, original_currency, fx_rate, amount_usdt, created_at
-        FROM transactions
-        WHERE employee_telegram_id = ? AND date_key = ?
-        ORDER BY created_at DESC
-        """,
-        (employee_telegram_id, today_key()),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+def get_total_outstanding():
+    rows = get_all_report_rows()
+    total_usdt_net = 0.0
+    total_thb_net = 0.0
+
+    for _employee_id, _name, summary in rows:
+        total_usdt_net += summary["repay"]["USDT"] - summary["borrow"]["USDT"]
+        total_thb_net += summary["repay"]["THB"] - summary["borrow"]["THB"]
+
+    total_usdt_outstanding = abs(total_usdt_net) if total_usdt_net < 0 else 0.0
+    total_thb_outstanding = abs(total_thb_net) if total_thb_net < 0 else 0.0
+
+    return {
+        "USDT": total_usdt_outstanding,
+        "THB": total_thb_outstanding,
+    }
 
 def get_recent_transactions_by_employee(employee_telegram_id: int, limit: int = 5):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT type, original_amount, original_currency, fx_rate, amount_usdt, created_at
+        SELECT type, reason, original_amount, original_currency, fx_rate, amount_usdt, created_at
         FROM transactions
         WHERE employee_telegram_id = ?
         ORDER BY created_at DESC
@@ -751,7 +866,7 @@ def get_history_transactions_by_employee(employee_telegram_id: int, page: int = 
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT type, original_amount, original_currency, fx_rate, amount_usdt, created_at
+        SELECT type, reason, original_amount, original_currency, fx_rate, amount_usdt, created_at
         FROM transactions
         WHERE employee_telegram_id = ?
         ORDER BY created_at DESC
@@ -802,28 +917,18 @@ def get_all_report_rows():
     conn.close()
     return result
 
-def build_today_text_for_user(user_id: int) -> str:
-    rows = get_today_transactions_by_employee(user_id)
-    if not rows:
-        return "📊 今天还没有你的记录。"
-
-    lines = ["📊 今日记录：", ""]
-
-    for tx_type, original_amount, original_currency, fx_rate, amount_usdt, created_at in rows:
-        kind = "借款" if tx_type == "borrow" else "还款"
-        lines.append(f"{created_at[11:16]} {kind}：{original_amount:.2f} {original_currency}")
-
-    return "\n".join(lines)
-
 def build_recent_flow_text_for_user(user_id: int) -> str:
     rows = get_recent_transactions_by_employee(user_id, limit=5)
     if not rows:
         return "📜 你还没有流水记录。"
 
     lines = ["📜 最近流水（最近 5 笔）：", ""]
-    for tx_type, original_amount, original_currency, fx_rate, amount_usdt, created_at in rows:
+    for tx_type, reason, original_amount, original_currency, fx_rate, amount_usdt, created_at in rows:
         kind = "借款" if tx_type == "borrow" else "还款"
-        lines.append(f"{created_at}｜{kind}｜{original_amount:.2f} {original_currency}")
+        reason_text = f"｜理由：{reason}" if reason else ""
+        lines.append(
+            f"{created_at}｜{kind}｜{original_amount:.2f} {original_currency}{reason_text}"
+        )
     return "\n".join(lines)
 
 def build_history_text_for_user(user_id: int, page: int) -> str:
@@ -833,10 +938,13 @@ def build_history_text_for_user(user_id: int, page: int) -> str:
 
     lines = [f"📚 历史记录（第 {page} 页）", ""]
     idx = (page - 1) * 10
-    for tx_type, original_amount, original_currency, fx_rate, amount_usdt, created_at in rows:
+    for tx_type, reason, original_amount, original_currency, fx_rate, amount_usdt, created_at in rows:
         idx += 1
         kind = "借款" if tx_type == "borrow" else "还款"
-        lines.append(f"{idx}. {created_at}｜{kind}｜{original_amount:.2f} {original_currency}")
+        reason_text = f"｜理由：{reason}" if reason else ""
+        lines.append(
+            f"{idx}. {created_at}｜{kind}｜{original_amount:.2f} {original_currency}{reason_text}"
+        )
     return "\n".join(lines)
 
 def build_total_text_for_user(user_id: int) -> str:
@@ -884,7 +992,16 @@ def build_all_report_text() -> str:
     if not rows:
         return "📊 当前没有任何账目记录。"
 
-    lines = ["📊 全部报表：", ""]
+    total_outstanding = get_total_outstanding()
+
+    lines = [
+        "📊 全部报表：",
+        "",
+        "📌 总借出",
+        f"USDT：{total_outstanding['USDT']:.2f}",
+        f"THB：{total_outstanding['THB']:.2f}",
+        "",
+    ]
 
     for _employee_id, name, summary in rows:
         usdt_net = summary["repay"]["USDT"] - summary["borrow"]["USDT"]
@@ -908,9 +1025,12 @@ def build_employee_flow_text(target_user_id: int) -> str:
         return f"📜 员工流水\n\n员工：{employee[2]}\n暂无流水记录。"
 
     lines = [f"📜 员工流水\n\n员工：{employee[2]}", ""]
-    for tx_type, original_amount, original_currency, fx_rate, amount_usdt, created_at in rows:
+    for tx_type, reason, original_amount, original_currency, fx_rate, amount_usdt, created_at in rows:
         kind = "借款" if tx_type == "borrow" else "还款"
-        lines.append(f"{created_at}｜{kind}｜{original_amount:.2f} {original_currency}")
+        reason_text = f"｜理由：{reason}" if reason else ""
+        lines.append(
+            f"{created_at}｜{kind}｜{original_amount:.2f} {original_currency}{reason_text}"
+        )
     return "\n".join(lines)
 
 def build_all_employees_flow_text(page: int = 1, page_size: int = 20) -> str:
@@ -928,6 +1048,7 @@ def build_all_employees_flow_text(page: int = 1, page_size: int = 20) -> str:
         SELECT
             employee_name_snapshot,
             type,
+            reason,
             original_amount,
             original_currency,
             fx_rate,
@@ -947,10 +1068,13 @@ def build_all_employees_flow_text(page: int = 1, page_size: int = 20) -> str:
 
     lines = [f"🗂 全部员工流水（第 {page} 页）", ""]
     idx = offset
-    for name, tx_type, original_amount, original_currency, fx_rate, amount_usdt, created_at in rows:
+    for name, tx_type, reason, original_amount, original_currency, fx_rate, amount_usdt, created_at in rows:
         idx += 1
         kind = "借款" if tx_type == "borrow" else "还款"
-        lines.append(f"{idx}. {created_at}｜{name}｜{kind}｜{original_amount:.2f} {original_currency}")
+        reason_text = f"｜理由：{reason}" if reason else ""
+        lines.append(
+            f"{idx}. {created_at}｜{name}｜{kind}｜{original_amount:.2f} {original_currency}{reason_text}"
+        )
 
     return "\n".join(lines)
 
@@ -962,6 +1086,7 @@ def build_today_all_employees_flow_text() -> str:
         SELECT
             employee_name_snapshot,
             type,
+            reason,
             original_amount,
             original_currency,
             fx_rate,
@@ -980,9 +1105,12 @@ def build_today_all_employees_flow_text() -> str:
         return "📆 今日全部流水\n\n今天还没有任何流水记录。"
 
     lines = [f"📆 今日全部流水（{today_key()}）", ""]
-    for name, tx_type, original_amount, original_currency, fx_rate, amount_usdt, created_at in rows:
+    for name, tx_type, reason, original_amount, original_currency, fx_rate, amount_usdt, created_at in rows:
         kind = "借款" if tx_type == "borrow" else "还款"
-        lines.append(f"{created_at[11:19]}｜{name}｜{kind}｜{original_amount:.2f} {original_currency}")
+        reason_text = f"｜理由：{reason}" if reason else ""
+        lines.append(
+            f"{created_at[11:19]}｜{name}｜{kind}｜{original_amount:.2f} {original_currency}{reason_text}"
+        )
 
     return "\n".join(lines)
 
@@ -990,49 +1118,14 @@ def build_today_all_employees_flow_text() -> str:
 # 日报 / 定时任务
 # ----------------------------
 def build_daily_report_text() -> str:
-    today = today_key()
-    rate, source = get_daily_rate(today)
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute(
-        """
-        SELECT
-            COALESCE(SUM(CASE WHEN type='borrow' THEN amount_usdt ELSE 0 END), 0),
-            COALESCE(SUM(CASE WHEN type='repay' THEN amount_usdt ELSE 0 END), 0),
-            COUNT(*)
-        FROM transactions
-        WHERE date_key = ?
-        """,
-        (today,),
-    )
-    row = cur.fetchone()
-    today_borrow = row[0] or 0
-    today_repay = row[1] or 0
-    today_count = row[2] or 0
-
-    cur.execute(
-        """
-        SELECT COUNT(*)
-        FROM employees
-        WHERE approved = 1 AND DATE(approved_at) = ?
-        """,
-        (today,),
-    )
-    new_approved = cur.fetchone()[0] or 0
-
-    conn.close()
+    total_outstanding = get_total_outstanding()
 
     lines = [
-        f"📊 每日汇总（{today}）",
+        f"📊 每日汇总（{today_key()}）",
         "",
-        f"💰 今日借款：{today_borrow:.2f} USDT",
-        f"💸 今日还款：{today_repay:.2f} USDT",
-        f"📄 今日流水：{today_count} 笔",
-        f"👥 今日新通过员工：{new_approved} 人",
-        "",
-        f"💱 今日参考汇率：1 USDT ≈ ฿{rate:.2f}（{source}）",
+        "📌 当前总借出",
+        f"USDT：{total_outstanding['USDT']:.2f}",
+        f"THB：{total_outstanding['THB']:.2f}",
     ]
 
     return "\n".join(lines)
@@ -1083,7 +1176,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = (
             "ℹ️ 使用说明\n\n"
             "员工首页：\n"
-            "📒 我的账本\n"
+            "📜 最近流水\n"
+            "📚 历史记录\n"
+            "💰 我的总账\n"
             "👤 我的资料\n"
             "📨 审核状态\n\n"
             "管理员首页：\n"
@@ -1263,9 +1358,26 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             await query.message.reply_text("删除失败。", reply_markup=get_main_menu_for_role(role))
         return
 
-    if data.endswith("|back_employees"):
-        action = data.split("|")[0]
-        await query.message.reply_text("请选择员工：", reply_markup=get_employee_picker(action))
+    if data == "borrow|back_employees":
+        await query.message.reply_text(
+            "请选择员工：",
+            reply_markup=get_employee_picker("borrow"),
+        )
+        return
+
+    if data.startswith("borrow|back_reason|"):
+        target_user_id = int(data.split("|")[2])
+        await query.message.reply_text(
+            "请选择借资理由：",
+            reply_markup=get_reason_picker(target_user_id),
+        )
+        return
+
+    if data == "repay|back_employees":
+        await query.message.reply_text(
+            "请选择员工：",
+            reply_markup=get_employee_picker("repay"),
+        )
         return
 
     if data.startswith("allflows|"):
@@ -1301,18 +1413,48 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             )
             return
 
+        if action == "borrow":
+            USER_SESSIONS[user_id] = {
+                "action": action,
+                "target_user_id": target_user_id,
+            }
+            await query.message.reply_text(
+                f"已选择员工：{get_employee_display_name_by_id(target_user_id)}\n请选择借资理由：",
+                reply_markup=get_reason_picker(target_user_id),
+            )
+            return
+
         USER_SESSIONS[user_id] = {
             "action": action,
             "target_user_id": target_user_id,
         }
-
         await query.message.reply_text(
             f"已选择员工：{get_employee_display_name_by_id(target_user_id)}\n请选择币种：",
             reply_markup=get_currency_picker(action, target_user_id),
         )
         return
 
-    if len(parts) == 4 and parts[1] == "currency":
+    if len(parts) == 4 and parts[1] == "reason":
+        action = parts[0]
+        target_user_id = int(parts[2])
+        reason = parts[3]
+
+        USER_SESSIONS[user_id] = {
+            "action": action,
+            "target_user_id": target_user_id,
+            "reason": reason,
+        }
+
+        await query.message.reply_text(
+            f"已选择员工：{get_employee_display_name_by_id(target_user_id)}\n借资理由：{reason}\n请选择币种：",
+            reply_markup=get_currency_picker(action, target_user_id, reason),
+        )
+        return
+
+    if action_is_borrow_currency(parts := data.split("|")):
+        pass
+
+    if len(parts) == 4 and parts[1] == "currency" and parts[0] == "repay":
         action = parts[0]
         target_user_id = int(parts[2])
         currency = parts[3]
@@ -1331,6 +1473,27 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
+    if len(parts) == 5 and parts[1] == "currency" and parts[0] == "borrow":
+        action = parts[0]
+        target_user_id = int(parts[2])
+        currency = parts[3]
+        reason = parts[4]
+
+        USER_SESSIONS[user_id] = {
+            "action": action,
+            "target_user_id": target_user_id,
+            "currency": currency,
+            "reason": reason,
+            "waiting_amount": True,
+        }
+
+        unit_name = "USDT" if currency == "USDT" else "泰铢"
+        await query.message.reply_text(
+            f"已选择：{get_employee_display_name_by_id(target_user_id)} / {reason} / {unit_name}\n\n请输入金额数字即可，例如：1000",
+            reply_markup=get_main_menu_for_role(role),
+        )
+        return
+
     if parts[0] == "history" and len(parts) == 3:
         target_user_id = int(parts[1])
         page = int(parts[2])
@@ -1344,6 +1507,9 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             reply_markup=get_history_page_menu(target_user_id, page),
         )
         return
+
+def action_is_borrow_currency(parts):
+    return len(parts) == 5 and parts[0] == "borrow" and parts[1] == "currency"
 
 # ----------------------------
 # 文本输入处理
@@ -1361,6 +1527,10 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if is_group_chat(update):
+        blocked = await handle_group_rate_limit(update, context, user_id)
+        if blocked:
+            return
+
         if text == "📝 员工登记":
             await update.message.reply_text(
                 "请点击下方按钮进入私聊登记：",
@@ -1370,9 +1540,7 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
         if text == "🛠 管理中心":
             if not is_manager(user_id):
-                await update.message.reply_text("❌ 没有权限", reply_markup=get_group_entry_menu())
                 return
-
             await update.message.reply_text(
                 "请点击下方按钮进入机器人私聊管理中心：",
                 reply_markup=get_open_admin_private_menu(),
@@ -1414,6 +1582,7 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 amount_text=amount_text,
                 operator_id=user_id,
                 operator_name=user.full_name,
+                reason=session.get("reason"),
             )
             USER_SESSIONS.pop(user_id, None)
 
@@ -1424,12 +1593,16 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             employee_id = session["target_user_id"]
             employee_name = result["employee_name"]
             parsed = result["parsed"]
+            reason = result.get("reason")
             net = get_currency_net_by_employee(employee_id)
+
+            reason_line = f"📝 借资理由：{reason}\n" if reason else ""
 
             if session["action"] == "borrow":
                 msg = (
                     f"✅ 已记录借款\n\n"
                     f"👤 员工：{employee_name}\n"
+                    f"{reason_line}"
                     f"📝 录入金额：{parsed['original_value']:.2f} {parsed['unit']}\n\n"
                     f"{format_signed_balance(net['USDT'], 'USDT')}\n"
                     f"{format_signed_balance(net['THB'], 'THB')}"
@@ -1510,18 +1683,6 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if text == "👤 我的资料":
         await update.message.reply_text(build_profile_text_for_user(user_id), reply_markup=get_main_menu_for_role(role))
-        return
-
-    if text == "📒 我的账本":
-        if role not in {"staff", "admin", "superadmin"}:
-            return
-        await update.message.reply_text("📒 我的账本：", reply_markup=get_wallet_menu())
-        return
-
-    if text == "📊 今日记录":
-        if role not in {"staff", "admin", "superadmin"}:
-            return
-        await update.message.reply_text(build_today_text_for_user(user_id), reply_markup=get_wallet_menu())
         return
 
     if text == "📜 最近流水":
