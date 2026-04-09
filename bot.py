@@ -1,9 +1,11 @@
 import os
 import re
+import time
 import sqlite3
 import logging
 from datetime import datetime
 
+import requests
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -22,14 +24,22 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
 DB_PATH = os.getenv("DB_PATH", "loan_bot.db")
 
-# 汇率：1 USDT = 多少 THB
-THB_PER_USDT = float(os.getenv("THB_PER_USDT", "36.50"))
+# 实时汇率相关
+THB_PER_USDT_FALLBACK = float(os.getenv("THB_PER_USDT_FALLBACK", "36.50"))
+COINGECKO_DEMO_API_KEY = os.getenv("COINGECKO_DEMO_API_KEY", "")
+FX_CACHE_SECONDS = int(os.getenv("FX_CACHE_SECONDS", "60"))
 
 ADMIN_IDS = set()
 for item in ADMIN_IDS_RAW.split(","):
     item = item.strip()
     if item.isdigit():
         ADMIN_IDS.add(int(item))
+
+# 汇率缓存
+_fx_cache = {
+    "thb_per_usdt": THB_PER_USDT_FALLBACK,
+    "updated_at": 0.0,
+}
 
 
 def get_conn():
@@ -66,7 +76,8 @@ def get_main_menu():
     keyboard = [
         ["📥 借款", "📤 还款", "🔎 查询"],
         ["📊 报表", "👤 我的ID", "ℹ️ 帮助"],
-        ["🧾 借款示例", "🧾 还款示例", "🏠 主菜单"],
+        ["🧾 借款示例", "🧾 还款示例", "💱 当前汇率"],
+        ["🏠 主菜单"],
     ]
     return ReplyKeyboardMarkup(
         keyboard,
@@ -79,16 +90,57 @@ def format_usdt(amount: float) -> str:
     return f"{amount:.2f} USDT"
 
 
-def format_thb_from_usdt(amount_usdt: float) -> str:
-    thb = amount_usdt * THB_PER_USDT
+def format_thb(amount_usdt: float, thb_per_usdt: float) -> str:
+    thb = amount_usdt * thb_per_usdt
     return f"฿{thb:,.2f}"
 
 
-def format_dual(amount_usdt: float) -> str:
-    return f"{amount_usdt:.2f} USDT（≈ {format_thb_from_usdt(amount_usdt)}）"
+def format_dual(amount_usdt: float, thb_per_usdt: float) -> str:
+    return f"{amount_usdt:.2f} USDT（≈ {format_thb(amount_usdt, thb_per_usdt)}）"
 
 
-def parse_amount(text: str):
+def get_live_thb_per_usdt() -> float:
+    """
+    实时获取 1 USDT = ? THB
+    走 CoinGecko /simple/price
+    失败则回退到 THB_PER_USDT_FALLBACK
+    """
+    global _fx_cache
+
+    now = time.time()
+    if now - _fx_cache["updated_at"] < FX_CACHE_SECONDS:
+        return _fx_cache["thb_per_usdt"]
+
+    headers = {}
+    if COINGECKO_DEMO_API_KEY:
+        headers["x-cg-demo-api-key"] = COINGECKO_DEMO_API_KEY
+
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {
+        "ids": "tether",
+        "vs_currencies": "thb",
+    }
+
+    try:
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        thb_per_usdt = float(data["tether"]["thb"])
+        if thb_per_usdt <= 0:
+            raise ValueError("Invalid exchange rate")
+
+        _fx_cache = {
+            "thb_per_usdt": thb_per_usdt,
+            "updated_at": now,
+        }
+        return thb_per_usdt
+    except Exception as e:
+        logging.warning("获取实时汇率失败，使用回退汇率。错误：%s", e)
+        return THB_PER_USDT_FALLBACK
+
+
+def parse_amount(text: str, thb_per_usdt: float):
     """
     支持：
     1000
@@ -99,12 +151,10 @@ def parse_amount(text: str):
     """
     raw = text.strip().upper().replace(" ", "")
 
-    # 中文单位兼容
     raw = raw.replace("泰铢", "THB")
     raw = raw.replace("銖", "THB")
     raw = raw.replace("铢", "THB")
 
-    # 兼容 U
     if raw.endswith("U"):
         raw = raw[:-1] + "USDT"
 
@@ -117,7 +167,6 @@ def parse_amount(text: str):
         unit = "THB"
         number_part = raw[:-3]
     else:
-        # 没写单位，默认按 USDT
         number_part = raw
 
     try:
@@ -128,7 +177,7 @@ def parse_amount(text: str):
         return None
 
     if unit == "THB":
-        usdt_value = value / THB_PER_USDT
+        usdt_value = value / thb_per_usdt
     else:
         usdt_value = value
 
@@ -197,6 +246,7 @@ async def require_admin(update: Update) -> bool:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    thb_per_usdt = get_live_thb_per_usdt()
     msg = (
         "🤖 借资记账机器人已上线\n\n"
         "支持中文输入：\n"
@@ -209,7 +259,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "金额支持：\n"
         "1000U / 1000USDT / 36500泰铢 / 36500THB\n\n"
         "系统统一按 USDT 入账并显示\n"
-        f"当前参考汇率：1 USDT ≈ ฿{THB_PER_USDT:.2f}\n\n"
+        f"当前实时参考汇率：1 USDT ≈ ฿{thb_per_usdt:.2f}\n\n"
         "示例：\n"
         "借款 张三 1000U\n"
         "借款 张三 36500泰铢\n"
@@ -239,6 +289,14 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, reply_markup=get_main_menu())
 
 
+async def fx_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    thb_per_usdt = get_live_thb_per_usdt()
+    await update.message.reply_text(
+        f"💱 当前实时参考汇率：1 USDT ≈ ฿{thb_per_usdt:.2f}",
+        reply_markup=get_main_menu(),
+    )
+
+
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
@@ -259,7 +317,8 @@ async def borrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     employee_name = context.args[0].strip()
-    parsed = parse_amount(context.args[1])
+    thb_per_usdt = get_live_thb_per_usdt()
+    parsed = parse_amount(context.args[1], thb_per_usdt)
 
     if not employee_name:
         await update.message.reply_text("姓名不能为空。", reply_markup=get_main_menu())
@@ -296,10 +355,10 @@ async def borrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ 已记录借资\n\n"
         f"👤 员工：{employee_name}\n"
         f"📝 录入金额：{parsed['original_value']:.2f} {parsed['unit']}\n"
-        f"💰 本次借资：{format_dual(parsed['usdt_value'])}\n"
-        f"📊 累计借资：{format_dual(borrowed)}\n"
-        f"📉 累计还款：{format_dual(repaid)}\n"
-        f"🧾 当前未还：{format_dual(balance)}",
+        f"💰 本次借资：{format_dual(parsed['usdt_value'], thb_per_usdt)}\n"
+        f"📊 累计借资：{format_dual(borrowed, thb_per_usdt)}\n"
+        f"📉 累计还款：{format_dual(repaid, thb_per_usdt)}\n"
+        f"🧾 当前未还：{format_dual(balance, thb_per_usdt)}",
         reply_markup=get_main_menu(),
     )
 
@@ -316,7 +375,8 @@ async def repay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     employee_name = context.args[0].strip()
-    parsed = parse_amount(context.args[1])
+    thb_per_usdt = get_live_thb_per_usdt()
+    parsed = parse_amount(context.args[1], thb_per_usdt)
 
     if not employee_name:
         await update.message.reply_text("姓名不能为空。", reply_markup=get_main_menu())
@@ -361,10 +421,10 @@ async def repay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ 已记录还款\n\n"
         f"👤 员工：{employee_name}\n"
         f"📝 录入金额：{parsed['original_value']:.2f} {parsed['unit']}\n"
-        f"💸 本次还款：{format_dual(parsed['usdt_value'])}\n"
-        f"📊 累计借资：{format_dual(borrowed)}\n"
-        f"📉 累计还款：{format_dual(repaid)}\n"
-        f"🧾 当前未还：{format_dual(balance)}",
+        f"💸 本次还款：{format_dual(parsed['usdt_value'], thb_per_usdt)}\n"
+        f"📊 累计借资：{format_dual(borrowed, thb_per_usdt)}\n"
+        f"📉 累计还款：{format_dual(repaid, thb_per_usdt)}\n"
+        f"🧾 当前未还：{format_dual(balance, thb_per_usdt)}",
         reply_markup=get_main_menu(),
     )
 
@@ -379,6 +439,7 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     employee_name = context.args[0].strip()
     borrowed, repaid, balance = get_balance(employee_name)
+    thb_per_usdt = get_live_thb_per_usdt()
 
     if borrowed == 0 and repaid == 0:
         await update.message.reply_text(
@@ -389,9 +450,9 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"🔎 员工：{employee_name}\n\n"
-        f"📊 累计借资：{format_dual(borrowed)}\n"
-        f"📉 累计还款：{format_dual(repaid)}\n"
-        f"🧾 当前未还：{format_dual(balance)}",
+        f"📊 累计借资：{format_dual(borrowed, thb_per_usdt)}\n"
+        f"📉 累计还款：{format_dual(repaid, thb_per_usdt)}\n"
+        f"🧾 当前未还：{format_dual(balance, thb_per_usdt)}",
         reply_markup=get_main_menu(),
     )
 
@@ -408,6 +469,7 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    thb_per_usdt = get_live_thb_per_usdt()
     total_borrowed = sum(row[1] for row in rows)
     total_repaid = sum(row[2] for row in rows)
     total_balance = sum(row[3] for row in rows)
@@ -416,15 +478,17 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for name, borrowed, repaid, balance in rows:
         lines.append(
-            f"{name}：借资 {format_dual(borrowed)} / 还款 {format_dual(repaid)} / 未还 {format_dual(balance)}"
+            f"{name}：借资 {format_dual(borrowed, thb_per_usdt)} / 还款 {format_dual(repaid, thb_per_usdt)} / 未还 {format_dual(balance, thb_per_usdt)}"
         )
 
     lines.extend(
         [
             "",
-            f"总借资：{format_dual(total_borrowed)}",
-            f"总还款：{format_dual(total_repaid)}",
-            f"总未还：{format_dual(total_balance)}",
+            f"总借资：{format_dual(total_borrowed, thb_per_usdt)}",
+            f"总还款：{format_dual(total_repaid, thb_per_usdt)}",
+            f"总未还：{format_dual(total_balance, thb_per_usdt)}",
+            "",
+            f"当前参考汇率：1 USDT ≈ ฿{thb_per_usdt:.2f}",
         ]
     )
 
@@ -439,7 +503,6 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not text:
         return
 
-    # 按钮菜单
     if text in ["🏠 主菜单", "菜单", "首页"]:
         await start(update, context)
         return
@@ -456,9 +519,13 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await report(update, context)
         return
 
+    if text in ["💱 当前汇率", "汇率"]:
+        await fx_cmd(update, context)
+        return
+
     if text == "🧾 借款示例":
         await update.message.reply_text(
-            "借款示例：\n借款 张三 1000U\n借款 张三 36500泰铢",
+            "借款示例：\n借款 张三 1000U\n借款 张三 36500泰铢\n借款 张三=36500THB",
             reply_markup=get_main_menu(),
         )
         return
@@ -491,10 +558,6 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    # 支持：
-    # 借款 张三 1000U
-    # 借款 张三=1000U
-    # 借款 张三，1000THB
     normalized = re.sub(r"[=，,]", " ", text)
     parts = normalized.split()
 
