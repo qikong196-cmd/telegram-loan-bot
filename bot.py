@@ -1644,20 +1644,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
-
----
-
-# 你怎么检查有没有复制错
-## 文件最后必须长这样：
-
-```python
-logging.info("Bot is starting...")
-app.run_polling()
-
-if __name__ == "__main__":
-    main()
-### 最后一行就是：
-```python
-    main()
-```
