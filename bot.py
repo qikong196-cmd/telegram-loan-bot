@@ -403,9 +403,14 @@ def get_recent_rates(limit: int = 7):
 # 菜单
 # ----------------------------
 def get_main_menu_for_role(role: str):
-    if role in {"guest", "pending"}:
+    if role == "guest":
         keyboard = [
-            ["📝 员工登记", "📨 审核状态"],
+            ["📝 员工登记"],
+            ["👤 我的ID", "ℹ️ 帮助"],
+        ]
+    elif role == "pending":
+        keyboard = [
+            ["📨 审核状态"],
             ["👤 我的ID", "ℹ️ 帮助"],
         ]
     elif role == "staff":
@@ -735,23 +740,6 @@ def get_all_report_rows():
     return rows
 
 
-def get_recent_transactions_all(limit: int = 10):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT employee_name_snapshot, type, original_amount, original_currency, fx_rate, amount_usdt, created_at
-        FROM transactions
-        ORDER BY created_at DESC
-        LIMIT ?
-        """,
-        (limit,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
 def build_today_text_for_user(user_id: int) -> str:
     rows = get_today_transactions_by_employee(user_id)
     if not rows:
@@ -835,19 +823,23 @@ def build_profile_text_for_user(user_id: int) -> str:
     role = get_role(user_id)
     row = get_employee_by_telegram_id(user_id)
 
-    if role in {"guest"} or not row:
+    if role == "guest" or not row:
         return "👤 你还没有登记员工资料。"
 
     tg_username = row[1] or "-"
     name = row[2]
     approved = "已通过" if row[4] == 1 else "待审批"
-    return (
-        f"👤 我的资料\n\n"
-        f"姓名：{name}\n"
-        f"用户名：@{tg_username}" if tg_username != "-" else f"👤 我的资料\n\n姓名：{name}\n用户名：-"
-    ) + (
-        f"\n角色：{role}\n状态：{approved}\n登记时间：{row[5]}"
-    )
+
+    lines = [
+        "👤 我的资料",
+        "",
+        f"姓名：{name}",
+        f"用户名：@{tg_username}" if tg_username != "-" else "用户名：-",
+        f"角色：{role}",
+        f"状态：{approved}",
+        f"登记时间：{row[5]}",
+    ]
+    return "\n".join(lines)
 
 
 def build_all_report_text() -> str:
@@ -1004,11 +996,11 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = get_role(update.effective_user.id)
     rate, _ = get_daily_rate(today_key())
-
     msg = (
         "🤖 借资记账机器人已上线\n\n"
-        "员工可用：今日记录、我的流水、历史记录、我的总账\n"
-        "管理员可用：管理中心、员工审批、借款还款、汇率设置、报表\n\n"
+        "新成员：只能登记 / 看审核状态\n"
+        "员工：只能看自己的记录和总账\n"
+        "管理员：有管理中心\n\n"
         f"今日汇率：1 USDT ≈ ฿{rate:.2f}"
     )
     await update.message.reply_text(msg, reply_markup=get_main_menu_for_role(role))
@@ -1018,18 +1010,16 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = get_role(update.effective_user.id)
     msg = (
         "ℹ️ 使用说明\n\n"
+        "新成员：\n"
+        "📝 员工登记\n"
+        "📨 审核状态\n\n"
         "员工：\n"
         "📊 今日记录\n"
         "📜 我的流水\n"
         "📚 历史记录\n"
         "💰 我的总账\n\n"
         "管理员：\n"
-        "🛠 管理中心 → 审批、借款、还款、报表、汇率\n\n"
-        "文本也支持：\n"
-        "借款 张三 1000U\n"
-        "还款 张三 36500THB\n"
-        "新增员工 张三\n"
-        "删除员工 张三"
+        "🛠 管理中心"
     )
     await update.message.reply_text(msg, reply_markup=get_main_menu_for_role(role))
 
@@ -1063,49 +1053,42 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
     if data == "admin|approvals":
         if not is_manager(user_id):
-            await query.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
             return
         await query.message.reply_text("✅ 员工审批：", reply_markup=get_pending_approval_menu())
         return
 
     if data == "admin|borrow":
         if not is_manager(user_id):
-            await query.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
             return
         await query.message.reply_text("请选择借款员工：", reply_markup=get_employee_picker("borrow"))
         return
 
     if data == "admin|repay":
         if not is_manager(user_id):
-            await query.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
             return
         await query.message.reply_text("请选择还款员工：", reply_markup=get_employee_picker("repay"))
         return
 
     if data == "admin|report":
         if not is_manager(user_id):
-            await query.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
             return
         await query.message.reply_text(build_all_report_text(), reply_markup=get_main_menu_for_role(role))
         return
 
     if data == "admin|employee_flow":
         if not is_manager(user_id):
-            await query.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
             return
         await query.message.reply_text("请选择员工查看流水：", reply_markup=get_employee_picker("flow"))
         return
 
     if data == "admin|delete_employee":
         if not is_manager(user_id):
-            await query.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
             return
         await query.message.reply_text("请选择要删除的员工：", reply_markup=get_delete_employee_menu())
         return
 
     if data == "admin|set_rate":
         if not is_manager(user_id):
-            await query.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
             return
         USER_SESSIONS[user_id] = {"waiting_rate_input": True}
         rate, source = get_daily_rate(today_key())
@@ -1116,6 +1099,8 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if data == "admin|show_rate":
+        if not is_manager(user_id):
+            return
         rate, source = get_daily_rate(today_key())
         recent = get_recent_rates(5)
         lines = [f"💱 今日汇率：1 USDT ≈ ฿{rate:.2f}（{source}）", "", "最近 5 天："]
@@ -1126,7 +1111,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
     if data.startswith("approve|"):
         if not is_manager(user_id):
-            await query.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
             return
         target_user_id = int(data.split("|")[1])
         if approve_employee(target_user_id, user_id, "staff"):
@@ -1145,7 +1129,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
     if data.startswith("reject|"):
         if not is_manager(user_id):
-            await query.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
             return
         target_user_id = int(data.split("|")[1])
         if reject_employee(target_user_id):
@@ -1163,7 +1146,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
     if data.startswith("delete|"):
         if not is_manager(user_id):
-            await query.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
             return
         target_user_id = int(data.split("|")[1])
         target_name = get_employee_display_name_by_id(target_user_id)
@@ -1192,7 +1174,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
         if action == "flow":
             if not is_manager(user_id):
-                await query.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
                 return
             await query.message.reply_text(
                 build_employee_flow_text(target_user_id),
@@ -1204,13 +1185,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             "action": action,
             "target_user_id": target_user_id,
         }
-
-        if action == "query":
-            await query.message.reply_text(
-                build_employee_flow_text(target_user_id),
-                reply_markup=get_main_menu_for_role(role),
-            )
-            return
 
         await query.message.reply_text(
             f"已选择员工：{get_employee_display_name_by_id(target_user_id)}\n请选择币种：",
@@ -1242,7 +1216,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         page = int(parts[2])
 
         if target_user_id != user_id and not is_manager(user_id):
-            await query.message.reply_text("你没有权限查看。", reply_markup=get_main_menu_for_role(role))
             return
 
         text = build_history_text_for_user(target_user_id, page)
@@ -1268,7 +1241,7 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not text:
         return
 
-    # 会话：等待输入金额
+    # 会话：等待输入金额 / 姓名 / 汇率
     if user_id in USER_SESSIONS:
         session = USER_SESSIONS[user_id]
 
@@ -1324,9 +1297,32 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             username = user.username or ""
             msg = register_employee_request(user_id, username, text)
             await update.message.reply_text(msg, reply_markup=get_main_menu_for_role(get_role(user_id)))
+
+            # 登记后私聊通知管理员
+            for admin_id in ADMIN_IDS:
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id,
+                        text=(
+                            "📨 新员工登记申请\n\n"
+                            f"姓名：{text}\n"
+                            f"Telegram ID：{user_id}\n"
+                            f"用户名：@{username}" if username else
+                            "📨 新员工登记申请\n\n"
+                            f"姓名：{text}\n"
+                            f"Telegram ID：{user_id}\n"
+                            "用户名：-"
+                        ) + "\n\n请到 管理中心 → 员工审批 处理",
+                    )
+                except Exception:
+                    pass
             return
 
         if session.get("waiting_rate_input"):
+            if not is_manager(user_id):
+                USER_SESSIONS.pop(user_id, None)
+                return
+
             try:
                 new_rate = float(text)
                 if new_rate <= 0:
@@ -1356,8 +1352,11 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await myid(update, context)
         return
 
-    # 待审批 / guest
+    # 未登记 / 待审批
     if text == "📝 员工登记":
+        if role != "guest":
+            await update.message.reply_text("你已登记或已通过审核。", reply_markup=get_main_menu_for_role(role))
+            return
         USER_SESSIONS[user_id] = {"waiting_register_name": True}
         await update.message.reply_text(
             "请输入你的员工姓名：",
@@ -1367,31 +1366,28 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if text == "📨 审核状态":
         if role == "pending":
-            await update.message.reply_text("📨 你的登记正在等待管理员审批。", reply_markup=get_main_menu_for_role(role))
+            await update.message.reply_text("📨 你的申请正在审核中，请等待管理员处理。", reply_markup=get_main_menu_for_role(role))
         elif role in {"staff", "admin", "superadmin"}:
-            await update.message.reply_text("✅ 你已经通过审批。", reply_markup=get_main_menu_for_role(role))
+            await update.message.reply_text("✅ 你已通过审核。", reply_markup=get_main_menu_for_role(role))
         else:
             await update.message.reply_text("你还没有提交登记。", reply_markup=get_main_menu_for_role(role))
         return
 
-    # 员工菜单
+    # 员工功能
     if text == "📊 今日记录":
         if role not in {"staff", "admin", "superadmin"}:
-            await update.message.reply_text("请先完成员工登记并通过审批。", reply_markup=get_main_menu_for_role(role))
             return
         await update.message.reply_text(build_today_text_for_user(user_id), reply_markup=get_main_menu_for_role(role))
         return
 
     if text == "📜 我的流水":
         if role not in {"staff", "admin", "superadmin"}:
-            await update.message.reply_text("请先完成员工登记并通过审批。", reply_markup=get_main_menu_for_role(role))
             return
         await update.message.reply_text(build_recent_flow_text_for_user(user_id), reply_markup=get_main_menu_for_role(role))
         return
 
     if text == "📚 历史记录":
         if role not in {"staff", "admin", "superadmin"}:
-            await update.message.reply_text("请先完成员工登记并通过审批。", reply_markup=get_main_menu_for_role(role))
             return
         await update.message.reply_text(
             build_history_text_for_user(user_id, 1),
@@ -1401,7 +1397,6 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if text == "💰 我的总账":
         if role not in {"staff", "admin", "superadmin"}:
-            await update.message.reply_text("请先完成员工登记并通过审批。", reply_markup=get_main_menu_for_role(role))
             return
         await update.message.reply_text(build_total_text_for_user(user_id), reply_markup=get_main_menu_for_role(role))
         return
@@ -1410,146 +1405,11 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(build_profile_text_for_user(user_id), reply_markup=get_main_menu_for_role(role))
         return
 
-    # 管理员菜单
+    # 管理员功能
     if text == "🛠 管理中心":
         if not is_manager(user_id):
-            await update.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
             return
         await update.message.reply_text("🛠 管理中心：", reply_markup=get_admin_center_menu())
-        return
-
-    if text == "📊 全部报表" and is_manager(user_id):
-        await update.message.reply_text(build_all_report_text(), reply_markup=get_main_menu_for_role(role))
-        return
-
-    if text == "🧾 借款示例":
-        await update.message.reply_text(
-            "借款示例：\n借款 张三 1000U\n借款 张三 36500泰铢\n借款 张三=36500THB",
-            reply_markup=get_main_menu_for_role(role),
-        )
-        return
-
-    if text == "🧾 还款示例":
-        await update.message.reply_text(
-            "还款示例：\n还款 张三 1000U\n还款 张三 36500THB",
-            reply_markup=get_main_menu_for_role(role),
-        )
-        return
-
-    # 文本指令兼容
-    normalized = re.sub(r"[=，,]", " ", text)
-    parts = normalized.split()
-
-    if not parts:
-        return
-
-    action = parts[0]
-
-    if action == "借款":
-        if not is_manager(user_id):
-            await update.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
-            return
-        if len(parts) < 3:
-            await update.message.reply_text("用法：借款 姓名 金额单位", reply_markup=get_main_menu_for_role(role))
-            return
-        emp = get_employee_by_name(parts[1])
-        if not emp or emp[4] != 1:
-            await update.message.reply_text("员工不存在或未通过审批。", reply_markup=get_main_menu_for_role(role))
-            return
-        ok, result = record_transaction(emp[0], "borrow", parts[2], user_id, user.full_name)
-        if not ok:
-            await update.message.reply_text(result, reply_markup=get_main_menu_for_role(role))
-            return
-        borrowed, repaid, balance = get_balance_by_employee_id(emp[0])
-        parsed = result["parsed"]
-        rate = result["rate"]
-        await update.message.reply_text(
-            f"✅ 已记录借资\n\n"
-            f"👤 员工：{result['employee_name']}\n"
-            f"📝 录入金额：{parsed['original_value']:.2f} {parsed['unit']}\n"
-            f"💰 本次借资：{format_dual(parsed['usdt_value'], rate)}\n"
-            f"📊 累计借资：{format_dual(borrowed, rate)}\n"
-            f"📉 累计还款：{format_dual(repaid, rate)}\n"
-            f"🧾 当前未还：{format_dual(balance, rate)}",
-            reply_markup=get_main_menu_for_role(role),
-        )
-        return
-
-    if action == "还款":
-        if not is_manager(user_id):
-            await update.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
-            return
-        if len(parts) < 3:
-            await update.message.reply_text("用法：还款 姓名 金额单位", reply_markup=get_main_menu_for_role(role))
-            return
-        emp = get_employee_by_name(parts[1])
-        if not emp or emp[4] != 1:
-            await update.message.reply_text("员工不存在或未通过审批。", reply_markup=get_main_menu_for_role(role))
-            return
-        ok, result = record_transaction(emp[0], "repay", parts[2], user_id, user.full_name)
-        if not ok:
-            await update.message.reply_text(result, reply_markup=get_main_menu_for_role(role))
-            return
-        borrowed, repaid, balance = get_balance_by_employee_id(emp[0])
-        parsed = result["parsed"]
-        rate = result["rate"]
-        await update.message.reply_text(
-            f"✅ 已记录还款\n\n"
-            f"👤 员工：{result['employee_name']}\n"
-            f"📝 录入金额：{parsed['original_value']:.2f} {parsed['unit']}\n"
-            f"💸 本次还款：{format_dual(parsed['usdt_value'], rate)}\n"
-            f"📊 累计借资：{format_dual(borrowed, rate)}\n"
-            f"📉 累计还款：{format_dual(repaid, rate)}\n"
-            f"🧾 当前未还：{format_dual(balance, rate)}",
-            reply_markup=get_main_menu_for_role(role),
-        )
-        return
-
-    if action == "查询":
-        if len(parts) < 2:
-            await update.message.reply_text("用法：查询 姓名", reply_markup=get_main_menu_for_role(role))
-            return
-        emp = get_employee_by_name(parts[1])
-        if not emp or emp[4] != 1:
-            await update.message.reply_text("员工不存在或未通过审批。", reply_markup=get_main_menu_for_role(role))
-            return
-        if emp[0] != user_id and not is_manager(user_id):
-            await update.message.reply_text("你只能查询自己的信息。", reply_markup=get_main_menu_for_role(role))
-            return
-        target_id = emp[0]
-        await update.message.reply_text(build_total_text_for_user(target_id), reply_markup=get_main_menu_for_role(role))
-        return
-
-    if action == "新增员工":
-        if not is_manager(user_id):
-            await update.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
-            return
-        if len(parts) < 2:
-            await update.message.reply_text("用法：新增员工 姓名", reply_markup=get_main_menu_for_role(role))
-            return
-        # 管理员直加仅登记为待审批不合适，这里仍建议员工自助登记
-        await update.message.reply_text(
-            "建议员工自己点击“员工登记”。当前版本管理员新增员工请让员工先和机器人互动完成登记。",
-            reply_markup=get_main_menu_for_role(role),
-        )
-        return
-
-    if action == "删除员工":
-        if not is_manager(user_id):
-            await update.message.reply_text("你没有权限。", reply_markup=get_main_menu_for_role(role))
-            return
-        if len(parts) < 2:
-            await update.message.reply_text("用法：删除员工 姓名", reply_markup=get_main_menu_for_role(role))
-            return
-        emp = get_employee_by_name(parts[1])
-        if not emp:
-            await update.message.reply_text("员工不存在。", reply_markup=get_main_menu_for_role(role))
-            return
-        ok = delete_employee(emp[0])
-        await update.message.reply_text(
-            f"{'✅ 已删除员工：' if ok else '删除失败：'}{parts[1]}",
-            reply_markup=get_main_menu_for_role(role),
-        )
         return
 
 
@@ -1560,14 +1420,12 @@ async def post_init(application: Application):
     rate = get_live_thb_per_usdt()
     upsert_daily_rate(today_key(), rate, "auto", None)
 
-    # 每天 09:00 自动抓汇率
     application.job_queue.run_daily(
         daily_fx_job,
         time=dtime(hour=9, minute=0, tzinfo=APP_TZ),
         name="daily_fx_job",
     )
 
-    # 每天 21:00 自动发日报到超级管理员私聊
     application.job_queue.run_daily(
         daily_report_job,
         time=dtime(hour=21, minute=0, tzinfo=APP_TZ),
