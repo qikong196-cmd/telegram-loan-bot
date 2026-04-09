@@ -30,7 +30,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
 DB_PATH = os.getenv("DB_PATH", "loan_bot.db")
 
-# 实时汇率相关
+# 汇率相关
 THB_PER_USDT_FALLBACK = float(os.getenv("THB_PER_USDT_FALLBACK", "36.50"))
 COINGECKO_DEMO_API_KEY = os.getenv("COINGECKO_DEMO_API_KEY", "")
 FX_CACHE_SECONDS = int(os.getenv("FX_CACHE_SECONDS", "60"))
@@ -41,18 +41,8 @@ for item in ADMIN_IDS_RAW.split(","):
     if item.isdigit():
         ADMIN_IDS.add(int(item))
 
-# 你可以在这里改员工名单
-EMPLOYEE_NAMES = [
-    "张三",
-    "李四",
-    "王五",
-    "赵六",
-]
-
-# 用户流程状态
 USER_SESSIONS = {}
 
-# 汇率缓存
 _fx_cache = {
     "thb_per_usdt": THB_PER_USDT_FALLBACK,
     "updated_at": 0.0,
@@ -81,6 +71,16 @@ def init_db():
         """
     )
 
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS employees (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -92,9 +92,9 @@ def is_admin(user_id: int) -> bool:
 def get_main_menu():
     keyboard = [
         ["📥 借款", "📤 还款", "🔎 查询"],
-        ["📊 报表", "👤 我的ID", "ℹ️ 帮助"],
-        ["🧾 借款示例", "🧾 还款示例", "💱 当前汇率"],
-        ["🏠 主菜单"],
+        ["➕ 新增员工", "❌ 删除员工", "📊 报表"],
+        ["👤 我的ID", "ℹ️ 帮助", "💱 当前汇率"],
+        ["🧾 借款示例", "🧾 还款示例", "🏠 主菜单"],
     ]
     return ReplyKeyboardMarkup(
         keyboard,
@@ -103,11 +103,67 @@ def get_main_menu():
     )
 
 
+def get_conn_cursor():
+    conn = get_conn()
+    cur = conn.cursor()
+    return conn, cur
+
+
+def get_employees():
+    conn, cur = get_conn_cursor()
+    cur.execute("SELECT name FROM employees ORDER BY name ASC")
+    rows = cur.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
+def add_employee(name: str) -> bool:
+    name = name.strip()
+    if not name:
+        return False
+
+    conn, cur = get_conn_cursor()
+    try:
+        cur.execute(
+            "INSERT INTO employees (name, created_at) VALUES (?, ?)",
+            (name, datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+
+def delete_employee(name: str) -> bool:
+    conn, cur = get_conn_cursor()
+    cur.execute("DELETE FROM employees WHERE name = ?", (name,))
+    affected = cur.rowcount
+    conn.commit()
+    conn.close()
+    return affected > 0
+
+
+def employee_exists(name: str) -> bool:
+    conn, cur = get_conn_cursor()
+    cur.execute("SELECT 1 FROM employees WHERE name = ? LIMIT 1", (name,))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
 def get_employee_inline_menu(action: str):
+    employees = get_employees()
+    if not employees:
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🏠 返回主菜单", callback_data="menu|home")]]
+        )
+
     rows = []
     row = []
 
-    for name in EMPLOYEE_NAMES:
+    for name in employees:
         row.append(
             InlineKeyboardButton(name, callback_data=f"{action}|employee|{name}")
         )
@@ -147,10 +203,16 @@ def get_currency_inline_menu(action: str, employee_name: str):
 
 
 def get_query_employee_inline_menu():
+    employees = get_employees()
+    if not employees:
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🏠 返回主菜单", callback_data="menu|home")]]
+        )
+
     rows = []
     row = []
 
-    for name in EMPLOYEE_NAMES:
+    for name in employees:
         row.append(
             InlineKeyboardButton(name, callback_data=f"query|employee|{name}")
         )
@@ -165,8 +227,29 @@ def get_query_employee_inline_menu():
     return InlineKeyboardMarkup(rows)
 
 
-def format_usdt(amount: float) -> str:
-    return f"{amount:.2f} USDT"
+def get_delete_employee_inline_menu():
+    employees = get_employees()
+    if not employees:
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🏠 返回主菜单", callback_data="menu|home")]]
+        )
+
+    rows = []
+    row = []
+
+    for name in employees:
+        row.append(
+            InlineKeyboardButton(f"❌ {name}", callback_data=f"delete_employee|{name}")
+        )
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+
+    if row:
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton("🏠 返回主菜单", callback_data="menu|home")])
+    return InlineKeyboardMarkup(rows)
 
 
 def format_thb(amount_usdt: float, thb_per_usdt: float) -> str:
@@ -215,14 +298,6 @@ def get_live_thb_per_usdt() -> float:
 
 
 def parse_amount(text: str, thb_per_usdt: float):
-    """
-    支持：
-    1000
-    1000U
-    1000USDT
-    36500THB
-    36500泰铢
-    """
     raw = text.strip().upper().replace(" ", "")
 
     raw = raw.replace("泰铢", "THB")
@@ -321,20 +396,16 @@ async def require_admin(update: Update) -> bool:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thb_per_usdt = get_live_thb_per_usdt()
+    employee_count = len(get_employees())
     msg = (
         "🤖 借资记账机器人已上线\n\n"
-        "现在支持按钮流程：\n"
-        "点击 借款 / 还款 / 查询\n"
-        "→ 选择员工\n"
-        "→ 选择币种\n"
-        "→ 输入金额\n\n"
-        "也支持手动输入：\n"
-        "借款 张三 1000U\n"
-        "借款 张三 36500泰铢\n"
-        "还款 张三 10000THB\n"
-        "查询 张三\n"
-        "报表\n\n"
-        "系统统一按 USDT 入账并显示\n"
+        "支持按钮流程：\n"
+        "借款 / 还款 / 查询 → 选择员工 → 选择币种 → 输入金额\n\n"
+        "支持员工管理：\n"
+        "➕ 新增员工\n"
+        "❌ 删除员工\n\n"
+        "当前员工人数："
+        f"{employee_count}\n"
         f"当前实时参考汇率：1 USDT ≈ ฿{thb_per_usdt:.2f}"
     )
     await update.message.reply_text(msg, reply_markup=get_main_menu())
@@ -346,12 +417,16 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "按钮模式：\n"
         "点击 借款 / 还款 / 查询\n"
         "按步骤选择即可\n\n"
+        "员工管理：\n"
+        "➕ 新增员工\n"
+        "❌ 删除员工\n\n"
         "文本模式：\n"
         "借款 姓名 金额单位\n"
         "还款 姓名 金额单位\n"
         "查询 姓名\n"
         "报表\n"
-        "我的ID\n\n"
+        "新增员工 姓名\n"
+        "删除员工 姓名\n\n"
         "金额支持：\n"
         "1000U / 1000USDT / 36500泰铢 / 36500THB"
     )
@@ -386,6 +461,13 @@ async def borrow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     employee_name = context.args[0].strip()
+    if not employee_exists(employee_name):
+        await update.message.reply_text(
+            f"员工 {employee_name} 不存在，请先新增员工。",
+            reply_markup=get_main_menu(),
+        )
+        return
+
     thb_per_usdt = get_live_thb_per_usdt()
     parsed = parse_amount(context.args[1], thb_per_usdt)
 
@@ -444,6 +526,13 @@ async def repay(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     employee_name = context.args[0].strip()
+    if not employee_exists(employee_name):
+        await update.message.reply_text(
+            f"员工 {employee_name} 不存在，请先新增员工。",
+            reply_markup=get_main_menu(),
+        )
+        return
+
     thb_per_usdt = get_live_thb_per_usdt()
     parsed = parse_amount(context.args[1], thb_per_usdt)
 
@@ -564,6 +653,62 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), reply_markup=get_main_menu())
 
 
+async def add_employee_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update):
+        return
+
+    if len(context.args) < 1:
+        await update.message.reply_text(
+            "用法：新增员工 姓名",
+            reply_markup=get_main_menu(),
+        )
+        return
+
+    name = " ".join(context.args).strip()
+    if not name:
+        await update.message.reply_text("员工姓名不能为空。", reply_markup=get_main_menu())
+        return
+
+    if add_employee(name):
+        await update.message.reply_text(
+            f"✅ 已新增员工：{name}",
+            reply_markup=get_main_menu(),
+        )
+    else:
+        await update.message.reply_text(
+            f"员工 {name} 已存在，或新增失败。",
+            reply_markup=get_main_menu(),
+        )
+
+
+async def delete_employee_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_admin(update):
+        return
+
+    if len(context.args) < 1:
+        await update.message.reply_text(
+            "用法：删除员工 姓名",
+            reply_markup=get_main_menu(),
+        )
+        return
+
+    name = " ".join(context.args).strip()
+    if not name:
+        await update.message.reply_text("员工姓名不能为空。", reply_markup=get_main_menu())
+        return
+
+    if delete_employee(name):
+        await update.message.reply_text(
+            f"✅ 已删除员工：{name}",
+            reply_markup=get_main_menu(),
+        )
+    else:
+        await update.message.reply_text(
+            f"员工 {name} 不存在，或删除失败。",
+            reply_markup=get_main_menu(),
+        )
+
+
 async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -578,6 +723,13 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
     if data == "borrow|start":
         USER_SESSIONS[user_id] = {"action": "borrow"}
+        employees = get_employees()
+        if not employees:
+            await query.message.reply_text(
+                "当前还没有员工，请先新增员工。",
+                reply_markup=get_main_menu(),
+            )
+            return
         await query.message.reply_text(
             "请选择借款员工：",
             reply_markup=get_employee_inline_menu("borrow"),
@@ -586,6 +738,13 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
 
     if data == "repay|start":
         USER_SESSIONS[user_id] = {"action": "repay"}
+        employees = get_employees()
+        if not employees:
+            await query.message.reply_text(
+                "当前还没有员工，请先新增员工。",
+                reply_markup=get_main_menu(),
+            )
+            return
         await query.message.reply_text(
             "请选择还款员工：",
             reply_markup=get_employee_inline_menu("repay"),
@@ -593,9 +752,30 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if data == "query|start":
+        employees = get_employees()
+        if not employees:
+            await query.message.reply_text(
+                "当前还没有员工，请先新增员工。",
+                reply_markup=get_main_menu(),
+            )
+            return
         await query.message.reply_text(
             "请选择查询员工：",
             reply_markup=get_query_employee_inline_menu(),
+        )
+        return
+
+    if data == "delete_employee|start":
+        employees = get_employees()
+        if not employees:
+            await query.message.reply_text(
+                "当前没有员工可删除。",
+                reply_markup=get_main_menu(),
+            )
+            return
+        await query.message.reply_text(
+            "请选择要删除的员工：",
+            reply_markup=get_delete_employee_inline_menu(),
         )
         return
 
@@ -611,6 +791,22 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             "请选择还款员工：",
             reply_markup=get_employee_inline_menu("repay"),
         )
+        return
+
+    if data.startswith("delete_employee|"):
+        parts = data.split("|", 1)
+        if len(parts) == 2:
+            name = parts[1]
+            if delete_employee(name):
+                await query.message.reply_text(
+                    f"✅ 已删除员工：{name}",
+                    reply_markup=get_main_menu(),
+                )
+            else:
+                await query.message.reply_text(
+                    f"删除失败，员工 {name} 可能不存在。",
+                    reply_markup=get_main_menu(),
+                )
         return
 
     parts = data.split("|")
@@ -667,7 +863,6 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     user_id = update.effective_user.id
 
-    # 按钮流程中的金额输入
     if user_id in USER_SESSIONS:
         session = USER_SESSIONS[user_id]
 
@@ -687,6 +882,21 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             elif session["action"] == "repay":
                 await repay(update, context)
 
+            USER_SESSIONS.pop(user_id, None)
+            return
+
+        if session.get("waiting_new_employee_name"):
+            name = text.strip()
+            if add_employee(name):
+                await update.message.reply_text(
+                    f"✅ 已新增员工：{name}",
+                    reply_markup=get_main_menu(),
+                )
+            else:
+                await update.message.reply_text(
+                    f"员工 {name} 已存在，或新增失败。",
+                    reply_markup=get_main_menu(),
+                )
             USER_SESSIONS.pop(user_id, None)
             return
 
@@ -725,6 +935,13 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if text == "📥 借款":
+        employees = get_employees()
+        if not employees:
+            await update.message.reply_text(
+                "当前还没有员工，请先新增员工。",
+                reply_markup=get_main_menu(),
+            )
+            return
         await update.message.reply_text(
             "请选择借款员工：",
             reply_markup=get_employee_inline_menu("borrow"),
@@ -732,6 +949,13 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if text == "📤 还款":
+        employees = get_employees()
+        if not employees:
+            await update.message.reply_text(
+                "当前还没有员工，请先新增员工。",
+                reply_markup=get_main_menu(),
+            )
+            return
         await update.message.reply_text(
             "请选择还款员工：",
             reply_markup=get_employee_inline_menu("repay"),
@@ -739,9 +963,38 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if text == "🔎 查询":
+        employees = get_employees()
+        if not employees:
+            await update.message.reply_text(
+                "当前还没有员工，请先新增员工。",
+                reply_markup=get_main_menu(),
+            )
+            return
         await update.message.reply_text(
             "请选择查询员工：",
             reply_markup=get_query_employee_inline_menu(),
+        )
+        return
+
+    if text == "➕ 新增员工":
+        USER_SESSIONS[user_id] = {"waiting_new_employee_name": True}
+        await update.message.reply_text(
+            "请输入要新增的员工姓名：",
+            reply_markup=get_main_menu(),
+        )
+        return
+
+    if text == "❌ 删除员工":
+        employees = get_employees()
+        if not employees:
+            await update.message.reply_text(
+                "当前没有员工可删除。",
+                reply_markup=get_main_menu(),
+            )
+            return
+        await update.message.reply_text(
+            "请选择要删除的员工：",
+            reply_markup=get_delete_employee_inline_menu(),
         )
         return
 
@@ -782,6 +1035,26 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         context.args = [parts[1]]
         await status_cmd(update, context)
+
+    elif action == "新增员工":
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "用法：新增员工 姓名",
+                reply_markup=get_main_menu(),
+            )
+            return
+        context.args = parts[1:]
+        await add_employee_cmd(update, context)
+
+    elif action == "删除员工":
+        if len(parts) < 2:
+            await update.message.reply_text(
+                "用法：删除员工 姓名",
+                reply_markup=get_main_menu(),
+            )
+            return
+        context.args = parts[1:]
+        await delete_employee_cmd(update, context)
 
 
 def main():
