@@ -19,6 +19,7 @@ from telegram.ext import (
     ContextTypes,
     MessageHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
     filters,
 )
 
@@ -53,30 +54,24 @@ _fx_cache = {
     "updated_at": 0.0,
 }
 
-
 # ----------------------------
 # 时间 / 基础工具
 # ----------------------------
 def now_local() -> datetime:
     return datetime.now(APP_TZ)
 
-
 def today_key() -> str:
     return now_local().strftime("%Y-%m-%d")
-
 
 def is_group_chat(update: Update) -> bool:
     chat_type = update.effective_chat.type
     return chat_type in ["group", "supergroup"]
 
-
 def get_private_link() -> str:
     return f"https://t.me/{BOT_USERNAME}"
 
-
 def get_conn():
     return sqlite3.connect(DB_PATH)
-
 
 def init_db():
     conn = get_conn()
@@ -91,12 +86,19 @@ def init_db():
             name TEXT NOT NULL,
             role TEXT NOT NULL DEFAULT 'staff',
             approved INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             approved_at TEXT,
             approved_by INTEGER
         )
         """
     )
+
+    # 兼容旧数据库
+    try:
+        cur.execute("ALTER TABLE employees ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    except sqlite3.OperationalError:
+        pass
 
     cur.execute(
         """
@@ -132,7 +134,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 # ----------------------------
 # 角色 / 员工
 # ----------------------------
@@ -141,7 +142,7 @@ def get_employee_by_telegram_id(user_id: int):
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT telegram_id, tg_username, name, role, approved, created_at, approved_at, approved_by
+        SELECT telegram_id, tg_username, name, role, approved, active, created_at, approved_at, approved_by
         FROM employees
         WHERE telegram_id = ?
         """,
@@ -151,13 +152,12 @@ def get_employee_by_telegram_id(user_id: int):
     conn.close()
     return row
 
-
 def get_employee_by_name(name: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT telegram_id, tg_username, name, role, approved, created_at, approved_at, approved_by
+        SELECT telegram_id, tg_username, name, role, approved, active, created_at, approved_at, approved_by
         FROM employees
         WHERE name = ?
         """,
@@ -167,13 +167,11 @@ def get_employee_by_name(name: str):
     conn.close()
     return row
 
-
 def get_employee_display_name_by_id(user_id: int) -> str:
     row = get_employee_by_telegram_id(user_id)
     if row:
         return row[2]
     return str(user_id)
-
 
 def get_all_approved_employees():
     conn = get_conn()
@@ -182,14 +180,13 @@ def get_all_approved_employees():
         """
         SELECT telegram_id, name, role
         FROM employees
-        WHERE approved = 1
+        WHERE approved = 1 AND active = 1
         ORDER BY name ASC
         """
     )
     rows = cur.fetchall()
     conn.close()
     return rows
-
 
 def get_pending_employees():
     conn = get_conn()
@@ -205,7 +202,6 @@ def get_pending_employees():
     rows = cur.fetchall()
     conn.close()
     return rows
-
 
 def register_employee_request(user_id: int, username: str, name: str) -> str:
     conn = get_conn()
@@ -225,7 +221,7 @@ def register_employee_request(user_id: int, username: str, name: str) -> str:
         cur.execute(
             """
             UPDATE employees
-            SET tg_username = ?, name = ?, created_at = ?
+            SET tg_username = ?, name = ?, created_at = ?, active = 1
             WHERE telegram_id = ?
             """,
             (username, name, now_local().strftime("%Y-%m-%d %H:%M:%S"), user_id),
@@ -236,15 +232,14 @@ def register_employee_request(user_id: int, username: str, name: str) -> str:
 
     cur.execute(
         """
-        INSERT INTO employees (telegram_id, tg_username, name, role, approved, created_at)
-        VALUES (?, ?, ?, 'staff', 0, ?)
+        INSERT INTO employees (telegram_id, tg_username, name, role, approved, active, created_at)
+        VALUES (?, ?, ?, 'staff', 0, 1, ?)
         """,
         (user_id, username, name, now_local().strftime("%Y-%m-%d %H:%M:%S")),
     )
     conn.commit()
     conn.close()
     return f"登记成功：{name}，等待管理员审批。"
-
 
 def approve_employee(user_id: int, approved_by: int, role: str = "staff") -> bool:
     conn = get_conn()
@@ -253,6 +248,7 @@ def approve_employee(user_id: int, approved_by: int, role: str = "staff") -> boo
         """
         UPDATE employees
         SET approved = 1,
+            active = 1,
             role = ?,
             approved_at = ?,
             approved_by = ?
@@ -265,7 +261,6 @@ def approve_employee(user_id: int, approved_by: int, role: str = "staff") -> boo
     conn.close()
     return changed > 0
 
-
 def reject_employee(user_id: int) -> bool:
     conn = get_conn()
     cur = conn.cursor()
@@ -274,7 +269,6 @@ def reject_employee(user_id: int) -> bool:
     conn.commit()
     conn.close()
     return changed > 0
-
 
 def delete_employee(user_id: int) -> bool:
     conn = get_conn()
@@ -285,6 +279,21 @@ def delete_employee(user_id: int) -> bool:
     conn.close()
     return changed > 0
 
+def deactivate_employee(user_id: int) -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE employees
+        SET active = 0
+        WHERE telegram_id = ? AND approved = 1
+        """,
+        (user_id,),
+    )
+    changed = cur.rowcount
+    conn.commit()
+    conn.close()
+    return changed > 0
 
 def get_role(user_id: int) -> str:
     if user_id in ADMIN_IDS:
@@ -296,19 +305,21 @@ def get_role(user_id: int) -> str:
 
     role = row[3]
     approved = row[4]
+    active = row[5]
 
     if approved != 1:
         return "pending"
+
+    if active != 1:
+        return "inactive"
 
     if role == "admin":
         return "admin"
 
     return "staff"
 
-
 def is_manager(user_id: int) -> bool:
     return get_role(user_id) in {"superadmin", "admin"}
-
 
 # ----------------------------
 # 汇率
@@ -347,7 +358,6 @@ def get_live_thb_per_usdt() -> float:
         logging.warning("获取实时汇率失败，使用回退汇率。错误：%s", e)
         return THB_PER_USDT_FALLBACK
 
-
 def upsert_daily_rate(rate_date: str, thb_per_usdt: float, source: str, set_by: int | None):
     conn = get_conn()
     cur = conn.cursor()
@@ -372,7 +382,6 @@ def upsert_daily_rate(rate_date: str, thb_per_usdt: float, source: str, set_by: 
     conn.commit()
     conn.close()
 
-
 def get_daily_rate(rate_date: str | None = None) -> tuple[float, str]:
     if not rate_date:
         rate_date = today_key()
@@ -393,24 +402,6 @@ def get_daily_rate(rate_date: str | None = None) -> tuple[float, str]:
     upsert_daily_rate(rate_date, rate, "auto", None)
     return rate, "auto"
 
-
-def get_recent_rates(limit: int = 7):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT rate_date, thb_per_usdt, source, updated_at
-        FROM daily_rates
-        ORDER BY rate_date DESC
-        LIMIT ?
-        """,
-        (limit,),
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-
 # ----------------------------
 # 菜单
 # ----------------------------
@@ -421,7 +412,6 @@ def get_group_entry_menu():
         one_time_keyboard=False,
     )
 
-
 def get_main_menu_for_role(role: str):
     if role == "guest":
         keyboard = [
@@ -431,6 +421,10 @@ def get_main_menu_for_role(role: str):
     elif role == "pending":
         keyboard = [
             ["📨 审核状态"],
+            ["ℹ️ 帮助"],
+        ]
+    elif role == "inactive":
+        keyboard = [
             ["ℹ️ 帮助"],
         ]
     elif role == "staff":
@@ -450,7 +444,6 @@ def get_main_menu_for_role(role: str):
         one_time_keyboard=False,
     )
 
-
 def get_wallet_menu():
     return ReplyKeyboardMarkup(
         [
@@ -462,18 +455,15 @@ def get_wallet_menu():
         one_time_keyboard=False,
     )
 
-
 def get_open_bot_private_menu():
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🤖 打开机器人", url=get_private_link())]]
+        [[InlineKeyboardButton("Air_4 备注机器助理进行登记", url=get_private_link())]]
     )
-
 
 def get_open_admin_private_menu():
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("🛠 打开管理后台", url=get_private_link())]]
+        [[InlineKeyboardButton("打开 Air_4 管理中心", url=get_private_link())]]
     )
-
 
 def get_admin_center_menu():
     return InlineKeyboardMarkup(
@@ -494,14 +484,9 @@ def get_admin_center_menu():
                 InlineKeyboardButton("📆 今日全部流水", callback_data="admin|today_all_flows"),
                 InlineKeyboardButton("❌ 删除员工", callback_data="admin|delete_employee"),
             ],
-            [
-                InlineKeyboardButton("💱 修改今日汇率", callback_data="admin|set_rate"),
-                InlineKeyboardButton("💱 查看今日汇率", callback_data="admin|show_rate"),
-            ],
             [InlineKeyboardButton("🏠 返回首页", callback_data="menu|home")],
         ]
     )
-
 
 def get_employee_picker(action: str):
     employees = get_all_approved_employees()
@@ -525,7 +510,6 @@ def get_employee_picker(action: str):
     rows.append([InlineKeyboardButton("🏠 返回首页", callback_data="menu|home")])
     return InlineKeyboardMarkup(rows)
 
-
 def get_currency_picker(action: str, employee_id: int):
     return InlineKeyboardMarkup(
         [
@@ -537,7 +521,6 @@ def get_currency_picker(action: str, employee_id: int):
             [InlineKeyboardButton("🏠 返回首页", callback_data="menu|home")],
         ]
     )
-
 
 def get_pending_approval_menu():
     rows = []
@@ -556,7 +539,6 @@ def get_pending_approval_menu():
     rows.append([InlineKeyboardButton("🏠 返回首页", callback_data="menu|home")])
     return InlineKeyboardMarkup(rows)
 
-
 def get_delete_employee_menu():
     rows = []
     employees = get_all_approved_employees()
@@ -571,7 +553,6 @@ def get_delete_employee_menu():
     rows.append([InlineKeyboardButton("🏠 返回首页", callback_data="menu|home")])
     return InlineKeyboardMarkup(rows)
 
-
 def get_history_page_menu(target_user_id: int, page: int):
     buttons = []
     nav = []
@@ -581,7 +562,6 @@ def get_history_page_menu(target_user_id: int, page: int):
     buttons.append(nav)
     buttons.append([InlineKeyboardButton("🏠 返回首页", callback_data="menu|home")])
     return InlineKeyboardMarkup(buttons)
-
 
 def get_all_flows_page_menu(page: int):
     nav = []
@@ -596,14 +576,13 @@ def get_all_flows_page_menu(page: int):
         ]
     )
 
-
 # ----------------------------
 # 格式化 / 交易
 # ----------------------------
-def format_dual(amount_usdt: float, thb_per_usdt: float) -> str:
-    thb = amount_usdt * thb_per_usdt
-    return f"{amount_usdt:.2f} USDT（≈ ฿{thb:,.2f}）"
-
+def format_money(amount: float, currency: str) -> str:
+    if currency == "THB":
+        return f"฿{amount:,.2f}"
+    return f"{amount:.2f} USDT"
 
 def parse_amount(text: str, thb_per_usdt: float):
     raw = text.strip().upper().replace(" ", "")
@@ -640,7 +619,6 @@ def parse_amount(text: str, thb_per_usdt: float):
         "usdt_value": usdt_value,
     }
 
-
 def record_transaction(
     employee_telegram_id: int,
     tx_type: str,
@@ -651,6 +629,9 @@ def record_transaction(
     employee = get_employee_by_telegram_id(employee_telegram_id)
     if not employee:
         return False, "员工不存在。"
+
+    if employee[5] != 1:
+        return False, "该员工已失效，无法继续记账。"
 
     employee_name = employee[2]
     rate, _source = get_daily_rate(today_key())
@@ -700,7 +681,6 @@ def record_transaction(
         "rate": rate,
     }
 
-
 def get_balance_by_employee_id(employee_telegram_id: int):
     conn = get_conn()
     cur = conn.cursor()
@@ -722,6 +702,34 @@ def get_balance_by_employee_id(employee_telegram_id: int):
     balance = borrowed - repaid
     return borrowed, repaid, balance
 
+def get_currency_summary_by_employee(employee_telegram_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            type,
+            original_currency,
+            COALESCE(SUM(original_amount), 0)
+        FROM transactions
+        WHERE employee_telegram_id = ?
+        GROUP BY type, original_currency
+        """,
+        (employee_telegram_id,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+
+    summary = {
+        "borrow": {"USDT": 0.0, "THB": 0.0},
+        "repay": {"USDT": 0.0, "THB": 0.0},
+    }
+
+    for tx_type, currency, amount in rows:
+        if tx_type in summary and currency in summary[tx_type]:
+            summary[tx_type][currency] = float(amount or 0)
+
+    return summary
 
 def get_today_transactions_by_employee(employee_telegram_id: int):
     conn = get_conn()
@@ -739,7 +747,6 @@ def get_today_transactions_by_employee(employee_telegram_id: int):
     conn.close()
     return rows
 
-
 def get_recent_transactions_by_employee(employee_telegram_id: int, limit: int = 5):
     conn = get_conn()
     cur = conn.cursor()
@@ -756,7 +763,6 @@ def get_recent_transactions_by_employee(employee_telegram_id: int, limit: int = 
     rows = cur.fetchall()
     conn.close()
     return rows
-
 
 def get_history_transactions_by_employee(employee_telegram_id: int, page: int = 1, page_size: int = 10):
     offset = (page - 1) * page_size
@@ -776,60 +782,58 @@ def get_history_transactions_by_employee(employee_telegram_id: int, page: int = 
     conn.close()
     return rows
 
-
 def get_all_report_rows():
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT
-            employee_telegram_id,
-            employee_name_snapshot,
-            COALESCE(SUM(CASE WHEN type='borrow' THEN amount_usdt ELSE 0 END), 0) AS borrowed,
-            COALESCE(SUM(CASE WHEN type='repay' THEN amount_usdt ELSE 0 END), 0) AS repaid,
-            COALESCE(SUM(CASE WHEN type='borrow' THEN amount_usdt ELSE 0 END), 0) -
-            COALESCE(SUM(CASE WHEN type='repay' THEN amount_usdt ELSE 0 END), 0) AS balance
+        SELECT DISTINCT employee_telegram_id, employee_name_snapshot
         FROM transactions
-        GROUP BY employee_telegram_id, employee_name_snapshot
-        ORDER BY balance DESC, employee_name_snapshot ASC
+        ORDER BY employee_name_snapshot ASC
         """
     )
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    employees = cur.fetchall()
 
+    result = []
+    for employee_id, employee_name in employees:
+        cur.execute(
+            """
+            SELECT type, original_currency, COALESCE(SUM(original_amount), 0)
+            FROM transactions
+            WHERE employee_telegram_id = ?
+            GROUP BY type, original_currency
+            """,
+            (employee_id,),
+        )
+        rows = cur.fetchall()
+
+        summary = {
+            "borrow": {"USDT": 0.0, "THB": 0.0},
+            "repay": {"USDT": 0.0, "THB": 0.0},
+        }
+        for tx_type, currency, amount in rows:
+            if tx_type in summary and currency in summary[tx_type]:
+                summary[tx_type][currency] = float(amount or 0)
+
+        result.append((employee_id, employee_name, summary))
+
+    conn.close()
+    return result
 
 def build_today_text_for_user(user_id: int) -> str:
     rows = get_today_transactions_by_employee(user_id)
     if not rows:
         return "📊 今天还没有你的记录。"
 
-    borrowed, repaid, balance = get_balance_by_employee_id(user_id)
     lines = ["📊 今日记录：", ""]
-
-    today_borrow_usdt = 0.0
-    today_repay_usdt = 0.0
 
     for tx_type, original_amount, original_currency, fx_rate, amount_usdt, created_at in rows:
         kind = "借款" if tx_type == "borrow" else "还款"
         lines.append(
-            f"{created_at[11:16]} {kind}：{original_amount:.2f} {original_currency} → {amount_usdt:.2f} USDT（汇率 {fx_rate:.2f}）"
+            f"{created_at[11:16]} {kind}：{original_amount:.2f} {original_currency}"
         )
-        if tx_type == "borrow":
-            today_borrow_usdt += amount_usdt
-        else:
-            today_repay_usdt += amount_usdt
 
-    lines.extend(
-        [
-            "",
-            f"今日借款：{today_borrow_usdt:.2f} USDT",
-            f"今日还款：{today_repay_usdt:.2f} USDT",
-            f"当前未还：{balance:.2f} USDT",
-        ]
-    )
     return "\n".join(lines)
-
 
 def build_recent_flow_text_for_user(user_id: int) -> str:
     rows = get_recent_transactions_by_employee(user_id, limit=5)
@@ -840,10 +844,9 @@ def build_recent_flow_text_for_user(user_id: int) -> str:
     for tx_type, original_amount, original_currency, fx_rate, amount_usdt, created_at in rows:
         kind = "借款" if tx_type == "borrow" else "还款"
         lines.append(
-            f"{created_at}｜{kind}｜{original_amount:.2f} {original_currency} → {amount_usdt:.2f} USDT（汇率 {fx_rate:.2f}）"
+            f"{created_at}｜{kind}｜{original_amount:.2f} {original_currency}"
         )
     return "\n".join(lines)
-
 
 def build_history_text_for_user(user_id: int, page: int) -> str:
     rows = get_history_transactions_by_employee(user_id, page=page, page_size=10)
@@ -856,10 +859,9 @@ def build_history_text_for_user(user_id: int, page: int) -> str:
         idx += 1
         kind = "借款" if tx_type == "borrow" else "还款"
         lines.append(
-            f"{idx}. {created_at}｜{kind}｜{original_amount:.2f} {original_currency} → {amount_usdt:.2f} USDT（汇率 {fx_rate:.2f}）"
+            f"{idx}. {created_at}｜{kind}｜{original_amount:.2f} {original_currency}"
         )
     return "\n".join(lines)
-
 
 def build_total_text_for_user(user_id: int) -> str:
     employee = get_employee_by_telegram_id(user_id)
@@ -867,16 +869,16 @@ def build_total_text_for_user(user_id: int) -> str:
         return "未找到你的员工资料。"
 
     name = employee[2]
-    borrowed, repaid, balance = get_balance_by_employee_id(user_id)
-    rate, _ = get_daily_rate(today_key())
+    summary = get_currency_summary_by_employee(user_id)
+
     return (
         f"💰 我的总账\n\n"
-        f"员工：{name}\n"
-        f"累计借资：{format_dual(borrowed, rate)}\n"
-        f"累计还款：{format_dual(repaid, rate)}\n"
-        f"当前未还：{format_dual(balance, rate)}"
+        f"员工：{name}\n\n"
+        f"借款 USDT：{summary['borrow']['USDT']:.2f} USDT\n"
+        f"借款 THB：{summary['borrow']['THB']:.2f} THB\n"
+        f"还款 USDT：{summary['repay']['USDT']:.2f} USDT\n"
+        f"还款 THB：{summary['repay']['THB']:.2f} THB"
     )
-
 
 def build_profile_text_for_user(user_id: int) -> str:
     role = get_role(user_id)
@@ -888,6 +890,7 @@ def build_profile_text_for_user(user_id: int) -> str:
     tg_username = row[1] or "-"
     name = row[2]
     approved = "已通过" if row[4] == 1 else "待审批"
+    active_text = "有效" if row[5] == 1 else "已失效"
 
     lines = [
         "👤 我的资料",
@@ -896,38 +899,29 @@ def build_profile_text_for_user(user_id: int) -> str:
         f"Telegram ID：{user_id}",
         f"用户名：@{tg_username}" if tg_username != "-" else "用户名：-",
         f"角色：{role}",
-        f"状态：{approved}",
-        f"登记时间：{row[5]}",
+        f"审核状态：{approved}",
+        f"员工状态：{active_text}",
+        f"登记时间：{row[6]}",
     ]
     return "\n".join(lines)
-
 
 def build_all_report_text() -> str:
     rows = get_all_report_rows()
     if not rows:
         return "📊 当前没有任何账目记录。"
 
-    rate, _ = get_daily_rate(today_key())
-    total_borrowed = sum(row[2] for row in rows)
-    total_repaid = sum(row[3] for row in rows)
-    total_balance = sum(row[4] for row in rows)
-
     lines = ["📊 全部报表：", ""]
-    for _employee_id, name, borrowed, repaid, balance in rows:
+
+    for _employee_id, name, summary in rows:
         lines.append(
-            f"{name}：借资 {format_dual(borrowed, rate)} / 还款 {format_dual(repaid, rate)} / 未还 {format_dual(balance, rate)}"
+            f"{name}："
+            f"\n借款 USDT：{summary['borrow']['USDT']:.2f} USDT"
+            f"\n借款 THB：{summary['borrow']['THB']:.2f} THB"
+            f"\n还款 USDT：{summary['repay']['USDT']:.2f} USDT"
+            f"\n还款 THB：{summary['repay']['THB']:.2f} THB\n"
         )
 
-    lines.extend(
-        [
-            "",
-            f"总借资：{format_dual(total_borrowed, rate)}",
-            f"总还款：{format_dual(total_repaid, rate)}",
-            f"总未还：{format_dual(total_balance, rate)}",
-        ]
-    )
     return "\n".join(lines)
-
 
 def build_employee_flow_text(target_user_id: int) -> str:
     employee = get_employee_by_telegram_id(target_user_id)
@@ -942,10 +936,9 @@ def build_employee_flow_text(target_user_id: int) -> str:
     for tx_type, original_amount, original_currency, fx_rate, amount_usdt, created_at in rows:
         kind = "借款" if tx_type == "borrow" else "还款"
         lines.append(
-            f"{created_at}｜{kind}｜{original_amount:.2f} {original_currency} → {amount_usdt:.2f} USDT（汇率 {fx_rate:.2f}）"
+            f"{created_at}｜{kind}｜{original_amount:.2f} {original_currency}"
         )
     return "\n".join(lines)
-
 
 def build_all_employees_flow_text(page: int = 1, page_size: int = 20) -> str:
     if page <= 0:
@@ -985,11 +978,10 @@ def build_all_employees_flow_text(page: int = 1, page_size: int = 20) -> str:
         idx += 1
         kind = "借款" if tx_type == "borrow" else "还款"
         lines.append(
-            f"{idx}. {created_at}｜{name}｜{kind}｜{original_amount:.2f} {original_currency} → {amount_usdt:.2f} USDT（汇率 {fx_rate:.2f}）"
+            f"{idx}. {created_at}｜{name}｜{kind}｜{original_amount:.2f} {original_currency}"
         )
 
     return "\n".join(lines)
-
 
 def build_today_all_employees_flow_text() -> str:
     conn = get_conn()
@@ -1020,11 +1012,10 @@ def build_today_all_employees_flow_text() -> str:
     for name, tx_type, original_amount, original_currency, fx_rate, amount_usdt, created_at in rows:
         kind = "借款" if tx_type == "borrow" else "还款"
         lines.append(
-            f"{created_at[11:19]}｜{name}｜{kind}｜{original_amount:.2f} {original_currency} → {amount_usdt:.2f} USDT（汇率 {fx_rate:.2f}）"
+            f"{created_at[11:19]}｜{name}｜{kind}｜{original_amount:.2f} {original_currency}"
         )
 
     return "\n".join(lines)
-
 
 # ----------------------------
 # 日报 / 定时任务
@@ -1062,31 +1053,6 @@ def build_daily_report_text() -> str:
     )
     new_approved = cur.fetchone()[0] or 0
 
-    cur.execute(
-        """
-        SELECT
-            employee_name_snapshot,
-            COALESCE(SUM(CASE WHEN type='borrow' THEN amount_usdt ELSE 0 END), 0) -
-            COALESCE(SUM(CASE WHEN type='repay' THEN amount_usdt ELSE 0 END), 0) AS balance
-        FROM transactions
-        GROUP BY employee_telegram_id, employee_name_snapshot
-        HAVING balance > 0
-        ORDER BY balance DESC
-        LIMIT 3
-        """
-    )
-    top_rows = cur.fetchall()
-
-    cur.execute(
-        """
-        SELECT
-            COALESCE(SUM(CASE WHEN type='borrow' THEN amount_usdt ELSE 0 END), 0) -
-            COALESCE(SUM(CASE WHEN type='repay' THEN amount_usdt ELSE 0 END), 0)
-        FROM transactions
-        """
-    )
-    total_balance = cur.fetchone()[0] or 0
-
     conn.close()
 
     lines = [
@@ -1094,31 +1060,18 @@ def build_daily_report_text() -> str:
         "",
         f"💰 今日借款：{today_borrow:.2f} USDT",
         f"💸 今日还款：{today_repay:.2f} USDT",
-        f"📉 净借出：{today_borrow - today_repay:.2f} USDT",
-        "",
-        f"📦 当前总未还：{total_balance:.2f} USDT",
-        f"👥 今日新通过员工：{new_approved} 人",
         f"📄 今日流水：{today_count} 笔",
+        f"👥 今日新通过员工：{new_approved} 人",
         "",
-        f"💱 今日汇率：1 USDT ≈ ฿{rate:.2f}（{source}）",
-        "",
-        "🏆 欠款前 3：",
+        f"💱 今日参考汇率：1 USDT ≈ ฿{rate:.2f}（{source}）",
     ]
 
-    if not top_rows:
-        lines.append("暂无")
-    else:
-        for idx, (name, balance) in enumerate(top_rows, start=1):
-            lines.append(f"{idx}. {name} - {balance:.2f} USDT")
-
     return "\n".join(lines)
-
 
 async def daily_fx_job(context: ContextTypes.DEFAULT_TYPE):
     rate = get_live_thb_per_usdt()
     upsert_daily_rate(today_key(), rate, "auto", None)
     logging.info("每日自动汇率更新完成：%s", rate)
-
 
 async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
     text = build_daily_report_text()
@@ -1128,55 +1081,54 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.warning("发送日报给管理员 %s 失败：%s", admin_id, e)
 
-
 # ----------------------------
 # 命令
 # ----------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = get_role(update.effective_user.id)
-    rate, _ = get_daily_rate(today_key())
 
     if is_group_chat(update):
-        msg = "📌 群入口：请点击按钮后前往私聊操作"
+        msg = "📌 群入口：请点击下方按钮前往私聊操作"
         await update.message.reply_text(msg, reply_markup=get_group_entry_menu())
         return
 
     msg = (
-        "🤖 欢迎使用借资系统\n\n"
+        "🤖 欢迎使用记账air_4助理\n\n"
         "员工：查看自己的账本和资料\n"
-        "管理员：进入管理中心操作\n\n"
-        f"今日汇率：1 USDT ≈ ฿{rate:.2f}"
+        "管理员：进入管理中心操作"
     )
     await update.message.reply_text(msg, reply_markup=get_main_menu_for_role(role))
-
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = get_role(update.effective_user.id)
     if is_group_chat(update):
         await update.message.reply_text(
-            f"请私聊机器人继续操作：\n{get_private_link()}",
+            "请使用群内按钮进入私聊。",
             reply_markup=get_group_entry_menu(),
         )
         return
 
-    msg = (
-        "ℹ️ 使用说明\n\n"
-        "员工首页：\n"
-        "📒 我的账本\n"
-        "👤 我的资料\n"
-        "📨 审核状态\n\n"
-        "管理员首页：\n"
-        "🛠 管理中心"
-    )
-    await update.message.reply_text(msg, reply_markup=get_main_menu_for_role(role))
+    if role == "inactive":
+        msg = "ℹ️ 你的员工权限已失效，请联系管理员。"
+    else:
+        msg = (
+            "ℹ️ 使用说明\n\n"
+            "员工首页：\n"
+            "📒 我的账本\n"
+            "👤 我的资料\n"
+            "📨 审核状态\n\n"
+            "管理员首页：\n"
+            "🛠 管理中心"
+        )
 
+    await update.message.reply_text(msg, reply_markup=get_main_menu_for_role(role))
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     role = get_role(update.effective_user.id)
     if is_group_chat(update):
         await update.message.reply_text(
-            f"请私聊机器人查看个人信息：\n{get_private_link()}",
-            reply_markup=get_group_entry_menu(),
+            "请私聊机器人查看个人信息。",
+            reply_markup=get_open_bot_private_menu(),
         )
         return
 
@@ -1185,6 +1137,37 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_main_menu_for_role(role),
     )
 
+# ----------------------------
+# 群成员变化：被踢出群后员工失效
+# ----------------------------
+async def handle_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.chat_member:
+        return
+
+    old_status = update.chat_member.old_chat_member.status
+    new_status = update.chat_member.new_chat_member.status
+    user = update.chat_member.new_chat_member.user
+
+    if not user:
+        return
+
+    user_id = user.id
+
+    kicked_statuses = {"left", "kicked"}
+    was_in_group = old_status not in {"left", "kicked"}
+    now_out_group = new_status in kicked_statuses
+
+    if was_in_group and now_out_group:
+        changed = deactivate_employee(user_id)
+        if changed:
+            logging.info("员工 %s 已离开/被踢出群，状态已失效。", user_id)
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="⚠️ 你已离开或被移出群组，员工权限已失效。如需恢复，请联系管理员。",
+                )
+            except Exception:
+                pass
 
 # ----------------------------
 # 按钮回调
@@ -1257,28 +1240,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         if not is_manager(user_id):
             return
         await query.message.reply_text("请选择要删除的员工：", reply_markup=get_delete_employee_menu())
-        return
-
-    if data == "admin|set_rate":
-        if not is_manager(user_id):
-            return
-        USER_SESSIONS[user_id] = {"waiting_rate_input": True}
-        rate, source = get_daily_rate(today_key())
-        await query.message.reply_text(
-            f"请输入今天要使用的汇率，例如：36.5\n\n当前：1 USDT ≈ ฿{rate:.2f}（{source}）",
-            reply_markup=get_main_menu_for_role(role),
-        )
-        return
-
-    if data == "admin|show_rate":
-        if not is_manager(user_id):
-            return
-        rate, source = get_daily_rate(today_key())
-        recent = get_recent_rates(5)
-        lines = [f"💱 今日汇率：1 USDT ≈ ฿{rate:.2f}（{source}）", "", "最近 5 天："]
-        for rate_date, thb_per_usdt, src, updated_at in recent:
-            lines.append(f"{rate_date}：{thb_per_usdt:.2f}（{src}）")
-        await query.message.reply_text("\n".join(lines), reply_markup=get_main_menu_for_role(role))
         return
 
     if data.startswith("approve|"):
@@ -1415,7 +1376,6 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
-
 # ----------------------------
 # 文本输入处理
 # ----------------------------
@@ -1431,31 +1391,54 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if not text:
         return
 
-    # 群里只做入口，不展开功能
+    # 群里只做入口
     if is_group_chat(update):
         if text == "📝 员工登记":
             await update.message.reply_text(
-                f"👉 请私聊我完成员工登记：\n{get_private_link()}",
-                reply_markup=get_group_entry_menu(),
+                "请点击下方按钮进入私聊登记：",
+                reply_markup=get_open_bot_private_menu(),
             )
             return
 
         if text == "🛠 管理中心":
             if not is_manager(user_id):
+                await update.message.reply_text("❌ 没有权限", reply_markup=get_group_entry_menu())
                 return
+
             await update.message.reply_text(
-                f"👉 请到私聊中打开管理中心：\n{get_private_link()}",
-                reply_markup=get_group_entry_menu(),
+                "请点击下方按钮进入机器人私聊管理中心：",
+                reply_markup=get_open_admin_private_menu(),
             )
             return
 
         return
 
-    # 会话：等待输入金额 / 姓名 / 汇率
+    # 失效员工限制
+    if role == "inactive":
+        if text in ["ℹ️ 帮助", "帮助"]:
+            await help_cmd(update, context)
+        else:
+            await update.message.reply_text(
+                "⚠️ 你的员工权限已失效，请联系管理员。",
+                reply_markup=get_main_menu_for_role(role),
+            )
+        return
+
+    # 会话：等待输入金额 / 姓名
     if user_id in USER_SESSIONS:
         session = USER_SESSIONS[user_id]
 
         if session.get("waiting_amount"):
+            if text in ["ℹ️ 帮助", "帮助", "🏠 返回首页", "返回首页", "首页", "菜单"]:
+                if text in ["ℹ️ 帮助", "帮助"]:
+                    USER_SESSIONS.pop(user_id, None)
+                    await help_cmd(update, context)
+                    return
+                else:
+                    USER_SESSIONS.pop(user_id, None)
+                    await start(update, context)
+                    return
+
             currency = session["currency"]
             amount_text = f"{text}USDT" if currency == "USDT" else f"{text}THB"
 
@@ -1473,36 +1456,45 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 return
 
             employee_id = session["target_user_id"]
-            borrowed, repaid, balance = get_balance_by_employee_id(employee_id)
+            summary = get_currency_summary_by_employee(employee_id)
             employee_name = result["employee_name"]
             parsed = result["parsed"]
-            rate = result["rate"]
 
             if session["action"] == "borrow":
                 msg = (
                     f"✅ 已记录借资\n\n"
                     f"👤 员工：{employee_name}\n"
-                    f"📝 录入金额：{parsed['original_value']:.2f} {parsed['unit']}\n"
-                    f"💰 本次借资：{format_dual(parsed['usdt_value'], rate)}\n"
-                    f"📊 累计借资：{format_dual(borrowed, rate)}\n"
-                    f"📉 累计还款：{format_dual(repaid, rate)}\n"
-                    f"🧾 当前未还：{format_dual(balance, rate)}"
+                    f"📝 录入金额：{parsed['original_value']:.2f} {parsed['unit']}\n\n"
+                    f"累计借款 USDT：{summary['borrow']['USDT']:.2f} USDT\n"
+                    f"累计借款 THB：{summary['borrow']['THB']:.2f} THB\n"
+                    f"累计还款 USDT：{summary['repay']['USDT']:.2f} USDT\n"
+                    f"累计还款 THB：{summary['repay']['THB']:.2f} THB"
                 )
             else:
                 msg = (
                     f"✅ 已记录还款\n\n"
                     f"👤 员工：{employee_name}\n"
-                    f"📝 录入金额：{parsed['original_value']:.2f} {parsed['unit']}\n"
-                    f"💸 本次还款：{format_dual(parsed['usdt_value'], rate)}\n"
-                    f"📊 累计借资：{format_dual(borrowed, rate)}\n"
-                    f"📉 累计还款：{format_dual(repaid, rate)}\n"
-                    f"🧾 当前未还：{format_dual(balance, rate)}"
+                    f"📝 录入金额：{parsed['original_value']:.2f} {parsed['unit']}\n\n"
+                    f"累计借款 USDT：{summary['borrow']['USDT']:.2f} USDT\n"
+                    f"累计借款 THB：{summary['borrow']['THB']:.2f} THB\n"
+                    f"累计还款 USDT：{summary['repay']['USDT']:.2f} USDT\n"
+                    f"累计还款 THB：{summary['repay']['THB']:.2f} THB"
                 )
 
             await update.message.reply_text(msg, reply_markup=get_main_menu_for_role(role))
             return
 
         if session.get("waiting_register_name"):
+            if text in ["ℹ️ 帮助", "帮助"]:
+                USER_SESSIONS.pop(user_id, None)
+                await help_cmd(update, context)
+                return
+
+            if text in ["🏠 返回首页", "返回首页", "首页", "菜单"]:
+                USER_SESSIONS.pop(user_id, None)
+                await start(update, context)
+                return
+
             USER_SESSIONS.pop(user_id, None)
             username = user.username or ""
             msg = register_employee_request(user_id, username, text)
@@ -1522,27 +1514,6 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                     await context.bot.send_message(chat_id=admin_id, text="\n".join(lines))
                 except Exception:
                     pass
-            return
-
-        if session.get("waiting_rate_input"):
-            if not is_manager(user_id):
-                USER_SESSIONS.pop(user_id, None)
-                return
-
-            try:
-                new_rate = float(text)
-                if new_rate <= 0:
-                    raise ValueError
-            except Exception:
-                await update.message.reply_text("请输入正确汇率，例如：36.5", reply_markup=get_main_menu_for_role(role))
-                return
-
-            upsert_daily_rate(today_key(), new_rate, "manual", user_id)
-            USER_SESSIONS.pop(user_id, None)
-            await update.message.reply_text(
-                f"✅ 已修改今日汇率：1 USDT ≈ ฿{new_rate:.2f}",
-                reply_markup=get_main_menu_for_role(role),
-            )
             return
 
     # 首页/帮助
@@ -1571,6 +1542,8 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("📨 你的申请正在审核中，请等待管理员处理。", reply_markup=get_main_menu_for_role(role))
         elif role in {"staff", "admin", "superadmin"}:
             await update.message.reply_text("✅ 你已通过审核。", reply_markup=get_main_menu_for_role(role))
+        elif role == "inactive":
+            await update.message.reply_text("⚠️ 你的员工权限已失效。", reply_markup=get_main_menu_for_role(role))
         else:
             await update.message.reply_text("你还没有提交登记。", reply_markup=get_main_menu_for_role(role))
         return
@@ -1617,10 +1590,10 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     # 管理中心
     if text == "🛠 管理中心":
         if not is_manager(user_id):
+            await update.message.reply_text("❌ 没有权限", reply_markup=get_main_menu_for_role(role))
             return
         await update.message.reply_text("🛠 管理中心：", reply_markup=get_admin_center_menu())
         return
-
 
 # ----------------------------
 # 启动
@@ -1643,7 +1616,6 @@ async def post_init(application: Application):
 
     logging.info("定时任务已启动。")
 
-
 def main():
     if not BOT_TOKEN:
         raise ValueError("缺少 BOT_TOKEN 环境变量")
@@ -1661,12 +1633,15 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("myid", myid))
 
+    app.add_handler(ChatMemberHandler(handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(button_callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chinese_text_handler))
 
     logging.info("Bot is starting...")
     app.run_polling()
 
-
 if __name__ == "__main__":
     main()
+```
+
+---
