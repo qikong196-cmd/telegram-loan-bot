@@ -1,4 +1,3 @@
-```python
 import os
 import time
 import sqlite3
@@ -1658,8 +1657,6 @@ app.run_polling()
 
 if __name__ == "__main__":
     main()
-```
-
 ### 最后一行就是：
 ```python
     main()
