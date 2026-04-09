@@ -46,7 +46,7 @@ GROUP_SPAM_MAX_VIOLATIONS = 3
 GROUP_SPAM_WINDOW_SECONDS = 600
 GROUP_MUTE_SECONDS = 600
 
-LOAN_REASONS = ["生活", "饮食", "K他命", "家里用", "交通费用"]
+LOAN_REASONS = ["生活", "饮食", "K他命", "家里用", "交通费用", "其他"]
 
 ADMIN_IDS = set()
 for item in ADMIN_IDS_RAW.split(","):
