@@ -6,12 +6,18 @@ import logging
 from datetime import datetime
 
 import requests
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
 )
 
@@ -34,6 +40,17 @@ for item in ADMIN_IDS_RAW.split(","):
     item = item.strip()
     if item.isdigit():
         ADMIN_IDS.add(int(item))
+
+# 你可以在这里改员工名单
+EMPLOYEE_NAMES = [
+    "张三",
+    "李四",
+    "王五",
+    "赵六",
+]
+
+# 用户流程状态
+USER_SESSIONS = {}
 
 # 汇率缓存
 _fx_cache = {
@@ -86,6 +103,68 @@ def get_main_menu():
     )
 
 
+def get_employee_inline_menu(action: str):
+    rows = []
+    row = []
+
+    for name in EMPLOYEE_NAMES:
+        row.append(
+            InlineKeyboardButton(name, callback_data=f"{action}|employee|{name}")
+        )
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+
+    if row:
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton("🏠 返回主菜单", callback_data="menu|home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def get_currency_inline_menu(action: str, employee_name: str):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "💵 USDT",
+                    callback_data=f"{action}|currency|{employee_name}|USDT",
+                ),
+                InlineKeyboardButton(
+                    "💴 泰铢",
+                    callback_data=f"{action}|currency|{employee_name}|THB",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ 返回员工列表",
+                    callback_data=f"{action}|back_employees",
+                )
+            ],
+            [InlineKeyboardButton("🏠 返回主菜单", callback_data="menu|home")],
+        ]
+    )
+
+
+def get_query_employee_inline_menu():
+    rows = []
+    row = []
+
+    for name in EMPLOYEE_NAMES:
+        row.append(
+            InlineKeyboardButton(name, callback_data=f"query|employee|{name}")
+        )
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+
+    if row:
+        rows.append(row)
+
+    rows.append([InlineKeyboardButton("🏠 返回主菜单", callback_data="menu|home")])
+    return InlineKeyboardMarkup(rows)
+
+
 def format_usdt(amount: float) -> str:
     return f"{amount:.2f} USDT"
 
@@ -100,11 +179,6 @@ def format_dual(amount_usdt: float, thb_per_usdt: float) -> str:
 
 
 def get_live_thb_per_usdt() -> float:
-    """
-    实时获取 1 USDT = ? THB
-    走 CoinGecko /simple/price
-    失败则回退到 THB_PER_USDT_FALLBACK
-    """
     global _fx_cache
 
     now = time.time()
@@ -249,21 +323,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thb_per_usdt = get_live_thb_per_usdt()
     msg = (
         "🤖 借资记账机器人已上线\n\n"
-        "支持中文输入：\n"
-        "借款 姓名 金额单位\n"
-        "还款 姓名 金额单位\n"
-        "查询 姓名\n"
-        "报表\n"
-        "我的ID\n"
-        "帮助\n\n"
-        "金额支持：\n"
-        "1000U / 1000USDT / 36500泰铢 / 36500THB\n\n"
-        "系统统一按 USDT 入账并显示\n"
-        f"当前实时参考汇率：1 USDT ≈ ฿{thb_per_usdt:.2f}\n\n"
-        "示例：\n"
+        "现在支持按钮流程：\n"
+        "点击 借款 / 还款 / 查询\n"
+        "→ 选择员工\n"
+        "→ 选择币种\n"
+        "→ 输入金额\n\n"
+        "也支持手动输入：\n"
         "借款 张三 1000U\n"
         "借款 张三 36500泰铢\n"
-        "还款 张三 10000THB"
+        "还款 张三 10000THB\n"
+        "查询 张三\n"
+        "报表\n\n"
+        "系统统一按 USDT 入账并显示\n"
+        f"当前实时参考汇率：1 USDT ≈ ฿{thb_per_usdt:.2f}"
     )
     await update.message.reply_text(msg, reply_markup=get_main_menu())
 
@@ -271,20 +343,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "ℹ️ 使用说明\n\n"
-        "中文命令：\n"
+        "按钮模式：\n"
+        "点击 借款 / 还款 / 查询\n"
+        "按步骤选择即可\n\n"
+        "文本模式：\n"
         "借款 姓名 金额单位\n"
         "还款 姓名 金额单位\n"
         "查询 姓名\n"
         "报表\n"
         "我的ID\n\n"
         "金额支持：\n"
-        "1000U / 1000USDT / 36500泰铢 / 36500THB\n\n"
-        "英文命令也支持：\n"
-        "/borrow 姓名 金额单位\n"
-        "/repay 姓名 金额单位\n"
-        "/status 姓名\n"
-        "/report\n"
-        "/myid"
+        "1000U / 1000USDT / 36500泰铢 / 36500THB"
     )
     await update.message.reply_text(msg, reply_markup=get_main_menu())
 
@@ -495,6 +564,99 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), reply_markup=get_main_menu())
 
 
+async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    data = query.data
+
+    if data == "menu|home":
+        USER_SESSIONS.pop(user_id, None)
+        await query.message.reply_text("🏠 已返回主菜单", reply_markup=get_main_menu())
+        return
+
+    if data == "borrow|start":
+        USER_SESSIONS[user_id] = {"action": "borrow"}
+        await query.message.reply_text(
+            "请选择借款员工：",
+            reply_markup=get_employee_inline_menu("borrow"),
+        )
+        return
+
+    if data == "repay|start":
+        USER_SESSIONS[user_id] = {"action": "repay"}
+        await query.message.reply_text(
+            "请选择还款员工：",
+            reply_markup=get_employee_inline_menu("repay"),
+        )
+        return
+
+    if data == "query|start":
+        await query.message.reply_text(
+            "请选择查询员工：",
+            reply_markup=get_query_employee_inline_menu(),
+        )
+        return
+
+    if data == "borrow|back_employees":
+        await query.message.reply_text(
+            "请选择借款员工：",
+            reply_markup=get_employee_inline_menu("borrow"),
+        )
+        return
+
+    if data == "repay|back_employees":
+        await query.message.reply_text(
+            "请选择还款员工：",
+            reply_markup=get_employee_inline_menu("repay"),
+        )
+        return
+
+    parts = data.split("|")
+
+    if len(parts) == 3 and parts[0] == "query" and parts[1] == "employee":
+        employee_name = parts[2]
+        context.args = [employee_name]
+        update.message = query.message
+        await status_cmd(update, context)
+        return
+
+    if len(parts) == 3 and parts[1] == "employee":
+        action = parts[0]
+        employee_name = parts[2]
+
+        USER_SESSIONS[user_id] = {
+            "action": action,
+            "employee_name": employee_name,
+        }
+
+        await query.message.reply_text(
+            f"已选择员工：{employee_name}\n请选择币种：",
+            reply_markup=get_currency_inline_menu(action, employee_name),
+        )
+        return
+
+    if len(parts) == 4 and parts[1] == "currency":
+        action = parts[0]
+        employee_name = parts[2]
+        currency = parts[3]
+
+        USER_SESSIONS[user_id] = {
+            "action": action,
+            "employee_name": employee_name,
+            "currency": currency,
+            "waiting_amount": True,
+        }
+
+        unit_name = "USDT" if currency == "USDT" else "泰铢"
+        await query.message.reply_text(
+            f"已选择：{employee_name} / {unit_name}\n\n请输入金额数字即可，例如：1000",
+            reply_markup=get_main_menu(),
+        )
+        return
+
+
 async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -502,6 +664,31 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     text = update.message.text.strip()
     if not text:
         return
+
+    user_id = update.effective_user.id
+
+    # 按钮流程中的金额输入
+    if user_id in USER_SESSIONS:
+        session = USER_SESSIONS[user_id]
+
+        if session.get("waiting_amount"):
+            text_amount = text.strip()
+            currency = session["currency"]
+
+            if currency == "USDT":
+                amount_text = f"{text_amount}USDT"
+            else:
+                amount_text = f"{text_amount}THB"
+
+            context.args = [session["employee_name"], amount_text]
+
+            if session["action"] == "borrow":
+                await borrow(update, context)
+            elif session["action"] == "repay":
+                await repay(update, context)
+
+            USER_SESSIONS.pop(user_id, None)
+            return
 
     if text in ["🏠 主菜单", "菜单", "首页"]:
         await start(update, context)
@@ -539,22 +726,22 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if text == "📥 借款":
         await update.message.reply_text(
-            "请输入：借款 姓名 金额单位\n例如：借款 张三 1000U\n或：借款 张三 36500泰铢",
-            reply_markup=get_main_menu(),
+            "请选择借款员工：",
+            reply_markup=get_employee_inline_menu("borrow"),
         )
         return
 
     if text == "📤 还款":
         await update.message.reply_text(
-            "请输入：还款 姓名 金额单位\n例如：还款 张三 1000THB",
-            reply_markup=get_main_menu(),
+            "请选择还款员工：",
+            reply_markup=get_employee_inline_menu("repay"),
         )
         return
 
     if text == "🔎 查询":
         await update.message.reply_text(
-            "请输入：查询 姓名\n例如：查询 张三",
-            reply_markup=get_main_menu(),
+            "请选择查询员工：",
+            reply_markup=get_query_employee_inline_menu(),
         )
         return
 
@@ -612,6 +799,8 @@ def main():
     app.add_handler(CommandHandler("repay", repay))
     app.add_handler(CommandHandler("status", status_cmd))
     app.add_handler(CommandHandler("report", report))
+
+    app.add_handler(CallbackQueryHandler(button_callback_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chinese_text_handler))
 
     logging.info("Bot is starting...")
