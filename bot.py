@@ -4,7 +4,7 @@ import logging
 from datetime import datetime
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -112,15 +112,17 @@ async def require_admin(update: Update) -> bool:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "借资记账机器人已上线。\n\n"
-        "可用命令：\n"
-        "/borrow 姓名 金额 - 记录借资\n"
-        "/repay 姓名 金额 - 记录还款\n"
-        "/status 姓名 - 查询个人账目\n"
-        "/report - 查看全部汇总\n"
-        "/myid - 查看你的 Telegram 用户ID"
+        "中文用法：\n"
+        "借款 姓名 金额\n"
+        "还款 姓名 金额\n"
+        "查询 姓名\n"
+        "报表\n"
+        "我的ID\n"
+        "帮助\n\n"
+        "示例：\n"
+        "借款 张三 100"
     )
     await update.message.reply_text(msg)
-
 
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -274,6 +276,52 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines))
 
 
+# 👇 注意这里是“顶格”（没有缩进）
+async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    parts = text.split()
+
+    if not parts:
+        return
+
+    action = parts[0]
+
+    if action == "借款":
+        context.args = parts[1:]
+        await borrow(update, context)
+
+    elif action == "还款":
+        context.args = parts[1:]
+        await repay(update, context)
+
+    elif action == "查询":
+        context.args = parts[1:]
+        await status_cmd(update, context)
+
+    elif action == "报表":
+        await report(update, context)
+
+    elif action in ["帮助", "菜单"]:
+        await start(update, context)
+
+    elif action in ["我的ID"]:
+        await myid(update, context)
+
+    for name, borrowed, repaid, balance in rows:
+        lines.append(
+            f"{name}：借资 {borrowed:.2f} / 还款 {repaid:.2f} / 未还 {balance:.2f}"
+        )
+
+    lines.extend([
+        "",
+        f"总借资：{total_borrowed:.2f}",
+        f"总还款：{total_repaid:.2f}",
+        f"总未还：{total_balance:.2f}"
+    ])
+
+    await update.message.reply_text("\n".join(lines))
+
+
 def main():
     if not BOT_TOKEN:
         raise ValueError("缺少 BOT_TOKEN 环境变量")
@@ -283,6 +331,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chinese_text_handler))
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("borrow", borrow))
     app.add_handler(CommandHandler("repay", repay))
