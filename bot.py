@@ -297,6 +297,50 @@ def register_employee_request(user_id: int, username: str, name: str) -> str:
     conn.close()
     return f"登记成功：{name}，等待管理员审批。"
 
+def admin_create_employee(telegram_id: int, username: str, name: str, approved_by: int, role: str = "staff"):
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT telegram_id FROM employees WHERE telegram_id = ?",
+        (telegram_id,),
+    )
+    row = cur.fetchone()
+
+    if row:
+        conn.close()
+        return False, "该 Telegram ID 已存在，不能重复新增。"
+
+    cur.execute(
+        """
+        INSERT INTO employees (
+            telegram_id,
+            tg_username,
+            name,
+            role,
+            approved,
+            active,
+            created_at,
+            approved_at,
+            approved_by
+        )
+        VALUES (?, ?, ?, ?, 1, 1, ?, ?, ?)
+        """,
+        (
+            telegram_id,
+            username,
+            name,
+            role,
+            now_local().strftime("%Y-%m-%d %H:%M:%S"),
+            now_local().strftime("%Y-%m-%d %H:%M:%S"),
+            approved_by,
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+    return True, f"已成功新增员工：{name}（ID: {telegram_id}）"
+
 def approve_employee(user_id: int, approved_by: int, role: str = "staff") -> bool:
     conn = get_conn()
     cur = conn.cursor()
@@ -534,6 +578,9 @@ def get_admin_center_menu():
             [
                 InlineKeyboardButton("📆 今日全部流水", callback_data="admin|today_all_flows"),
                 InlineKeyboardButton("❌ 删除员工", callback_data="admin|delete_employee"),
+            ],
+            [
+                InlineKeyboardButton("➕ 手动新增员工", callback_data="admin|create_employee"),
             ],
             [InlineKeyboardButton("🏠 返回首页", callback_data="menu|home")],
         ]
@@ -1216,6 +1263,20 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         await query.message.reply_text("请选择要删除的员工：", reply_markup=get_delete_employee_menu())
         return
 
+    if data == "admin|create_employee":
+        if not is_manager(user_id):
+            return
+
+        USER_SESSIONS[user_id] = {
+            "action": "admin_create_employee",
+            "waiting_employee_id": True,
+        }
+        await query.message.reply_text(
+            "请输入要新增员工的 Telegram 数字 ID：",
+            reply_markup=get_main_menu_for_role(role),
+        )
+        return
+
     if data.startswith("approve|"):
         if not is_manager(user_id):
             return
@@ -1273,11 +1334,7 @@ async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if data == "repay|back":
-        target_user_id = USER_SESSIONS.get(user_id, {}).get("target_user_id")
-        if target_user_id:
-            await query.message.reply_text("请选择员工：", reply_markup=get_employee_picker("repay"))
-        else:
-            await query.message.reply_text("请选择员工：", reply_markup=get_employee_picker("repay"))
+        await query.message.reply_text("请选择员工：", reply_markup=get_employee_picker("repay"))
         return
 
     if data == "borrow|back":
@@ -1452,6 +1509,72 @@ async def chinese_text_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if user_id in USER_SESSIONS:
         session = USER_SESSIONS[user_id]
+
+        if session.get("waiting_employee_id"):
+            if text in ["🏠 返回首页", "返回首页", "首页", "菜单"]:
+                USER_SESSIONS.pop(user_id, None)
+                await start(update, context)
+                return
+
+            if not text.isdigit():
+                await update.message.reply_text(
+                    "请输入正确的 Telegram 数字 ID，例如：123456789",
+                    reply_markup=get_main_menu_for_role(role),
+                )
+                return
+
+            USER_SESSIONS[user_id]["new_employee_id"] = int(text)
+            USER_SESSIONS[user_id]["waiting_employee_id"] = False
+            USER_SESSIONS[user_id]["waiting_employee_name"] = True
+
+            await update.message.reply_text(
+                "请输入员工姓名：",
+                reply_markup=get_main_menu_for_role(role),
+            )
+            return
+
+        if session.get("waiting_employee_name"):
+            if text in ["🏠 返回首页", "返回首页", "首页", "菜单"]:
+                USER_SESSIONS.pop(user_id, None)
+                await start(update, context)
+                return
+
+            new_employee_id = session.get("new_employee_id")
+            employee_name = text.strip()
+
+            if not employee_name:
+                await update.message.reply_text(
+                    "员工姓名不能为空，请重新输入。",
+                    reply_markup=get_main_menu_for_role(role),
+                )
+                return
+
+            ok, msg = admin_create_employee(
+                telegram_id=new_employee_id,
+                username="",
+                name=employee_name,
+                approved_by=user_id,
+                role="staff",
+            )
+
+            USER_SESSIONS.pop(user_id, None)
+
+            await update.message.reply_text(
+                msg,
+                reply_markup=get_main_menu_for_role(role),
+            )
+
+            if ok:
+                try:
+                    await context.bot.send_message(
+                        chat_id=new_employee_id,
+                        text=f"✅ 你已被管理员加入系统。\n姓名：{employee_name}",
+                        reply_markup=get_main_menu_for_role("staff"),
+                    )
+                except Exception:
+                    pass
+
+            return
 
         if session.get("waiting_custom_reason"):
             if text in ["🏠 返回首页", "返回首页", "首页", "菜单"]:
